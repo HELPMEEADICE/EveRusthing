@@ -20,13 +20,14 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows_sys::Win32::UI::Controls::{
-    ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
-    LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW, LVIF_TEXT, LVIS_FOCUSED,
-    LVIS_SELECTED, LVITEMW, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT, LVM_INSERTCOLUMNW,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVN_COLUMNCLICK,
-    LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
-    LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS, NM_DBLCLK, NM_RCLICK, NM_RETURN,
-    NMHDR, NMLISTVIEW, NMLVDISPINFOW, SB_SETTEXTW, SBARS_SIZEGRIP, STATUSCLASSNAMEW, WC_LISTVIEWW,
+    ICC_LISTVIEW_CLASSES, ICC_STANDARD_CLASSES, ICC_TREEVIEW_CLASSES, INITCOMMONCONTROLSEX,
+    InitCommonControlsEx, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW,
+    LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_GETNEXTITEM, LVM_GETSELECTEDCOUNT,
+    LVM_INSERTCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVM_SETITEMSTATE,
+    LVN_COLUMNCLICK, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER,
+    LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS, NM_DBLCLK,
+    NM_RCLICK, NM_RETURN, NMHDR, NMLISTVIEW, NMLVDISPINFOW, SB_SETTEXTW, SBARS_SIZEGRIP,
+    STATUSCLASSNAMEW, WC_LISTVIEWW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_DOWN, VK_ESCAPE, VK_RETURN};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
@@ -50,6 +51,8 @@ use crate::ntfs::{NtfsVolume, discover_ntfs_volumes};
 use crate::query::{Query, QueryOptions};
 use crate::service;
 
+mod options_dialog;
+
 const CLASS_NAME: &str = "EVERUSTHING";
 const WINDOW_TITLE: &str = "EveRusthing";
 const ID_SEARCH_EDIT: usize = 100;
@@ -71,6 +74,7 @@ const CMD_BOOKMARKS: usize = 1041;
 const CMD_HELP: usize = 1050;
 const CMD_ABOUT: usize = 1051;
 const WM_INDEX_LOADED: u32 = WM_APP + 1;
+const WM_OPTIONS_APPLIED: u32 = WM_APP + 2;
 const CF_UNICODETEXT: u32 = 13;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,6 +85,8 @@ struct GuiSettings {
     height: i32,
     maximized: bool,
     show_status_bar: bool,
+    show_selected_item_in_statusbar: bool,
+    search_as_you_type: bool,
     options: QueryOptions,
 }
 
@@ -93,6 +99,8 @@ impl Default for GuiSettings {
             height: 560,
             maximized: false,
             show_status_bar: true,
+            show_selected_item_in_statusbar: true,
+            search_as_you_type: true,
             options: QueryOptions::default(),
         }
     }
@@ -114,6 +122,10 @@ impl GuiSettings {
                 }
                 "window_maximized" => settings.maximized = parse_bool(value),
                 "show_status_bar" => settings.show_status_bar = parse_bool(value),
+                "show_selected_item_in_statusbar" => {
+                    settings.show_selected_item_in_statusbar = parse_bool(value)
+                }
+                "search_as_you_type" => settings.search_as_you_type = parse_bool(value),
                 "match_case" => settings.options.match_case = parse_bool(value),
                 "match_whole_word" => settings.options.match_whole_word = parse_bool(value),
                 "match_path" => settings.options.match_path = parse_bool(value),
@@ -127,13 +139,15 @@ impl GuiSettings {
 
     fn serialize(&self) -> String {
         format!(
-            "[Everything]\r\nwindow_x={}\r\nwindow_y={}\r\nwindow_width={}\r\nwindow_height={}\r\nwindow_maximized={}\r\nshow_status_bar={}\r\nmatch_case={}\r\nmatch_whole_word={}\r\nmatch_path={}\r\n",
+            "[Everything]\r\nwindow_x={}\r\nwindow_y={}\r\nwindow_width={}\r\nwindow_height={}\r\nwindow_maximized={}\r\nshow_status_bar={}\r\nshow_selected_item_in_statusbar={}\r\nsearch_as_you_type={}\r\nmatch_case={}\r\nmatch_whole_word={}\r\nmatch_path={}\r\n",
             self.x,
             self.y,
             self.width,
             self.height,
             u8::from(self.maximized),
             u8::from(self.show_status_bar),
+            u8::from(self.show_selected_item_in_statusbar),
+            u8::from(self.search_as_you_type),
             u8::from(self.options.match_case),
             u8::from(self.options.match_whole_word),
             u8::from(self.options.match_path),
@@ -164,8 +178,12 @@ struct AppState {
     sort_column: usize,
     sort_ascending: bool,
     show_status_bar: bool,
+    show_selected_item_in_statusbar: bool,
+    search_as_you_type: bool,
     loading: bool,
     settings_path: PathBuf,
+    pipe_name: String,
+    use_database: bool,
 }
 
 pub fn run(
@@ -189,7 +207,7 @@ pub fn run(
     }
     let controls = INITCOMMONCONTROLSEX {
         dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
-        dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES,
+        dwICC: ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES | ICC_TREEVIEW_CLASSES,
     };
     unsafe { InitCommonControlsEx(&controls) };
 
@@ -287,8 +305,12 @@ pub fn run(
         sort_column: 0,
         sort_ascending: true,
         show_status_bar: settings.show_status_bar,
+        show_selected_item_in_statusbar: settings.show_selected_item_in_statusbar,
+        search_as_you_type: settings.search_as_you_type,
         loading: true,
         settings_path,
+        pipe_name: pipe_name.to_owned(),
+        use_database,
     });
     let state = Box::into_raw(state);
     unsafe {
@@ -318,7 +340,7 @@ pub fn run(
         if result == -1 {
             return Err("read Windows GUI message failed".into());
         }
-        if unsafe { handle_search_key(&*state, &message) } {
+        if unsafe { handle_search_key(&mut *state, &message) } {
             continue;
         }
         unsafe {
@@ -349,7 +371,7 @@ unsafe extern "system" fn window_proc(
             let command = wparam & 0xffff;
             let notification = (wparam >> 16) as u32;
             let state = unsafe { &mut *state_ptr };
-            if command == ID_SEARCH_EDIT && notification == EN_CHANGE {
+            if command == ID_SEARCH_EDIT && notification == EN_CHANGE && state.search_as_you_type {
                 unsafe { refresh_results(state) };
             } else {
                 unsafe { handle_command(window, state, command) };
@@ -389,6 +411,32 @@ unsafe extern "system" fn window_proc(
                         set_status(state, &error);
                     }
                 }
+            }
+            0
+        }
+        WM_OPTIONS_APPLIED if !state_ptr.is_null() => {
+            let applied = unsafe { Box::from_raw(lparam as *mut options_dialog::AppliedOptions) };
+            let state = unsafe { &mut *state_ptr };
+            state.show_status_bar = applied.config.show_status_bar;
+            state.show_selected_item_in_statusbar = applied.config.show_selected_item_in_statusbar;
+            state.search_as_you_type = applied.config.search_as_you_type;
+            state.options = applied.config.query;
+            unsafe {
+                sync_menu_checks(window, state);
+                layout(window, state);
+                refresh_results(state);
+                save_settings(window, state);
+            }
+            if applied.force_rebuild {
+                state.loading = true;
+                state.records.clear();
+                state.visible.clear();
+                state.last_search = None;
+                unsafe {
+                    SendMessageW(state.list, LVM_SETITEMCOUNT, 0, 0);
+                    set_status(state, "Rebuilding database...");
+                }
+                start_index_load(window, state.pipe_name.clone(), state.use_database, true);
             }
             0
         }
@@ -483,11 +531,20 @@ unsafe fn handle_command(window: HWND, state: &mut AppState, command: usize) {
             unsafe { option_changed(window, state) };
         }
         CMD_OPTIONS => unsafe {
-            show_message(
+            let config = options_dialog::OptionsConfig {
+                show_status_bar: state.show_status_bar,
+                show_selected_item_in_statusbar: state.show_selected_item_in_statusbar,
+                search_as_you_type: state.search_as_you_type,
+                query: state.options,
+            };
+            options_dialog::show(
                 window,
-                "Everything Options",
-                "Search options are available from the Search menu.\r\nAdditional Everything 1.4 option pages will be added with their indexing backends.",
-            )
+                config,
+                &state.settings_path,
+                &database::default_path(),
+                state.records.len(),
+                WM_OPTIONS_APPLIED,
+            );
         },
         CMD_BOOKMARKS => unsafe {
             show_message(
@@ -641,16 +698,42 @@ unsafe fn layout(window: HWND, state: &AppState) {
     }
 }
 
-unsafe fn handle_search_key(state: &AppState, message: &MSG) -> bool {
+unsafe fn handle_search_key(state: &mut AppState, message: &MSG) -> bool {
     if message.hwnd != state.search || message.message != WM_KEYDOWN {
         return false;
     }
     match message.wParam as u16 {
         VK_ESCAPE => {
             unsafe { SetWindowTextW(state.search, wide_null("").as_ptr()) };
+            if !state.search_as_you_type {
+                unsafe { refresh_results(state) };
+            }
             true
         }
-        VK_RETURN | VK_DOWN if !state.visible.is_empty() => {
+        VK_RETURN => {
+            if !state.search_as_you_type {
+                unsafe { refresh_results(state) };
+            }
+            if state.visible.is_empty() {
+                return true;
+            }
+            let mut item = LVITEMW {
+                stateMask: LVIS_SELECTED | LVIS_FOCUSED,
+                state: LVIS_SELECTED | LVIS_FOCUSED,
+                ..LVITEMW::default()
+            };
+            unsafe {
+                SendMessageW(
+                    state.list,
+                    LVM_SETITEMSTATE,
+                    0,
+                    &mut item as *mut LVITEMW as isize,
+                );
+                SetFocus(state.list);
+            }
+            true
+        }
+        VK_DOWN if !state.visible.is_empty() => {
             let mut item = LVITEMW {
                 stateMask: LVIS_SELECTED | LVIS_FOCUSED,
                 state: LVIS_SELECTED | LVIS_FOCUSED,
@@ -821,6 +904,10 @@ unsafe fn select_all(state: &AppState) {
 }
 
 unsafe fn update_selection_status(state: &AppState) {
+    if !state.show_selected_item_in_statusbar {
+        unsafe { set_object_status(state, state.visible.len()) };
+        return;
+    }
     let count = unsafe { SendMessageW(state.list, LVM_GETSELECTEDCOUNT, 0, 0) as usize };
     if count == 0 {
         unsafe { set_object_status(state, state.visible.len()) };
@@ -1146,6 +1233,8 @@ fn save_settings(window: HWND, state: &AppState) {
         height: rectangle.bottom - rectangle.top,
         maximized: placement.showCmd == SW_SHOWMAXIMIZED as u32,
         show_status_bar: state.show_status_bar,
+        show_selected_item_in_statusbar: state.show_selected_item_in_statusbar,
+        search_as_you_type: state.search_as_you_type,
         options: state.options,
     };
     let _ = fs::write(&state.settings_path, settings.serialize());
@@ -1168,6 +1257,8 @@ mod tests {
             height: 600,
             maximized: true,
             show_status_bar: false,
+            show_selected_item_in_statusbar: false,
+            search_as_you_type: false,
             options: QueryOptions {
                 match_case: true,
                 match_path: true,
