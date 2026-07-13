@@ -436,9 +436,17 @@ fn decode_snapshot(decoder: &mut Decoder<impl Read>) -> Result<DatabaseSnapshot,
 }
 
 pub(crate) fn compare_ascii_case_insensitive(left: &str, right: &str) -> std::cmp::Ordering {
-    left.bytes()
-        .map(|byte| byte.to_ascii_lowercase())
-        .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    for index in 0..left.len().min(right.len()) {
+        let order = left[index]
+            .to_ascii_lowercase()
+            .cmp(&right[index].to_ascii_lowercase());
+        if order != std::cmp::Ordering::Equal {
+            return order;
+        }
+    }
+    left.len().cmp(&right.len())
 }
 
 fn temporary_path(path: &Path) -> PathBuf {

@@ -3,6 +3,7 @@ pub mod efu;
 pub mod index;
 pub mod model;
 pub mod query;
+mod result_sort;
 pub mod service_protocol;
 
 #[cfg(windows)]

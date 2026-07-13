@@ -1,4 +1,3 @@
-use std::cmp::Ordering as CmpOrdering;
 use std::env;
 use std::fs;
 use std::mem::size_of;
@@ -49,6 +48,7 @@ use crate::database::{self, VolumeCheckpoint};
 use crate::index::SharedIndex;
 use crate::monitor::{self, MonitorEvent};
 use crate::query::{Query, QueryOptions};
+use crate::result_sort::ResultSorter;
 
 mod options_dialog;
 
@@ -188,6 +188,7 @@ struct AppState {
     options: QueryOptions,
     sort_column: usize,
     sort_ascending: bool,
+    result_sorter: ResultSorter,
     show_status_bar: bool,
     show_selected_item_in_statusbar: bool,
     search_as_you_type: bool,
@@ -317,6 +318,7 @@ pub fn run(
         options: settings.options,
         sort_column: 0,
         sort_ascending: true,
+        result_sorter: ResultSorter::default(),
         show_status_bar: settings.show_status_bar,
         show_selected_item_in_statusbar: settings.show_selected_item_in_statusbar,
         search_as_you_type: settings.search_as_you_type,
@@ -408,6 +410,7 @@ unsafe extern "system" fn window_proc(
                         checkpoints,
                     } = loaded;
                     state.records = records;
+                    state.result_sorter.invalidate();
                     if unsafe { window_text(state.search) }.is_empty()
                         && state.sort_column == 0
                         && state.sort_ascending
@@ -452,6 +455,7 @@ unsafe extern "system" fn window_proc(
             match result.records {
                 Ok(records) => {
                     state.records = records;
+                    state.result_sorter.invalidate();
                     state.last_search = None;
                     unsafe { refresh_results(state) };
                 }
@@ -529,11 +533,12 @@ unsafe fn handle_notification(window: HWND, state: &mut AppState, lparam: LPARAM
             let column = info.iSubItem.max(0) as usize;
             if state.sort_column == column {
                 state.sort_ascending = !state.sort_ascending;
+                state.visible.reverse();
             } else {
                 state.sort_column = column;
                 state.sort_ascending = true;
+                sort_results(state, false);
             }
-            sort_results(state, false);
             unsafe { SendMessageW(state.list, LVM_SETITEMCOUNT, state.visible.len(), 0) };
         }
         LVN_ITEMCHANGED => unsafe { update_selection_status(state) },
@@ -645,16 +650,32 @@ unsafe fn refresh_results(state: &mut AppState) {
                     .retain(|index| query.matches(&state.records[*index as usize]));
             } else {
                 state.visible.clear();
-                state.visible.extend(
+                if state.sort_column != 0
+                    && let Some(order) = state.result_sorter.ordered_indices(state.sort_column)
+                {
+                    state.visible.extend(
+                        order
+                            .iter()
+                            .copied()
+                            .filter(|index| query.matches(&state.records[*index as usize])),
+                    );
+                    if !state.sort_ascending {
+                        state.visible.reverse();
+                    }
+                } else {
                     state
-                        .records
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, record)| {
-                            query.matches(record).then_some(index as u32)
-                        }),
-                );
-                sort_results(state, true);
+                        .visible
+                        .extend(
+                            state
+                                .records
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, record)| {
+                                    query.matches(record).then_some(index as u32)
+                                }),
+                        );
+                    sort_results(state, true);
+                }
             }
             state.last_search = Some(search);
             state.last_options = state.options;
@@ -675,32 +696,13 @@ unsafe fn refresh_results(state: &mut AppState) {
 }
 
 fn sort_results(state: &mut AppState, already_default_sorted: bool) {
-    if state.sort_column == 0 && state.sort_ascending {
-        if !already_default_sorted {
-            state.visible.sort_unstable();
-        }
-        return;
-    }
-    let records = &state.records;
-    let column = state.sort_column;
-    let ascending = state.sort_ascending;
-    state.visible.sort_unstable_by(|left, right| {
-        let order = compare_records(&records[*left as usize], &records[*right as usize], column);
-        if ascending { order } else { order.reverse() }
-    });
-}
-
-fn compare_records(left: &FileRecord, right: &FileRecord, column: usize) -> CmpOrdering {
-    match column {
-        0 => crate::database::compare_ascii_case_insensitive(left.file_name(), right.file_name()),
-        1 => {
-            crate::database::compare_ascii_case_insensitive(left.parent_path(), right.parent_path())
-        }
-        2 => left.size.cmp(&right.size),
-        3 => left.date_modified.cmp(&right.date_modified),
-        _ => CmpOrdering::Equal,
-    }
-    .then_with(|| left.path.cmp(&right.path))
+    state.result_sorter.sort(
+        &state.records,
+        &mut state.visible,
+        state.sort_column,
+        state.sort_ascending,
+        already_default_sorted,
+    );
 }
 
 fn is_simple_search(search: &str) -> bool {
