@@ -4,6 +4,7 @@ use std::mem::size_of;
 use std::path::PathBuf;
 use std::process::Command;
 use std::ptr::{copy_nonoverlapping, null, null_mut};
+use std::sync::Arc;
 use std::thread;
 
 use windows_sys::Win32::Foundation::{
@@ -75,6 +76,7 @@ const CMD_ABOUT: usize = 1051;
 const WM_INDEX_LOADED: u32 = WM_APP + 1;
 const WM_OPTIONS_APPLIED: u32 = WM_APP + 2;
 const WM_INDEX_UPDATED: u32 = WM_APP + 3;
+const WM_SORT_READY: u32 = WM_APP + 4;
 const CF_UNICODETEXT: u32 = 13;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -177,11 +179,17 @@ struct MonitorResult {
     records: Result<Vec<FileRecord>, String>,
 }
 
+struct SortResult {
+    records_generation: u64,
+    column: usize,
+    order: Vec<u32>,
+}
+
 struct AppState {
     search: HWND,
     list: HWND,
     status: HWND,
-    records: Vec<FileRecord>,
+    records: Arc<Vec<FileRecord>>,
     visible: Vec<u32>,
     last_search: Option<String>,
     last_options: QueryOptions,
@@ -189,6 +197,8 @@ struct AppState {
     sort_column: usize,
     sort_ascending: bool,
     result_sorter: ResultSorter,
+    records_generation: u64,
+    sort_in_progress: bool,
     show_status_bar: bool,
     show_selected_item_in_statusbar: bool,
     search_as_you_type: bool,
@@ -311,7 +321,7 @@ pub fn run(
         search,
         list,
         status,
-        records: Vec::new(),
+        records: Arc::new(Vec::new()),
         visible: Vec::new(),
         last_search: None,
         last_options: settings.options,
@@ -319,6 +329,8 @@ pub fn run(
         sort_column: 0,
         sort_ascending: true,
         result_sorter: ResultSorter::default(),
+        records_generation: 0,
+        sort_in_progress: false,
         show_status_bar: settings.show_status_bar,
         show_selected_item_in_statusbar: settings.show_selected_item_in_statusbar,
         search_as_you_type: settings.search_as_you_type,
@@ -409,8 +421,7 @@ unsafe extern "system" fn window_proc(
                         index,
                         checkpoints,
                     } = loaded;
-                    state.records = records;
-                    state.result_sorter.invalidate();
+                    replace_records(state, records);
                     if unsafe { window_text(state.search) }.is_empty()
                         && state.sort_column == 0
                         && state.sort_ascending
@@ -425,6 +436,7 @@ unsafe extern "system" fn window_proc(
                     } else {
                         unsafe { refresh_results(state) };
                     }
+                    request_background_sort(window, state);
                     state.monitor_generation = state.monitor_generation.wrapping_add(1);
                     state.monitor = Some(start_monitor(
                         window,
@@ -436,7 +448,7 @@ unsafe extern "system" fn window_proc(
                     ));
                 }
                 Err(error) => {
-                    state.records.clear();
+                    replace_records(state, Vec::new());
                     state.visible.clear();
                     unsafe {
                         SendMessageW(state.list, LVM_SETITEMCOUNT, 0, 0);
@@ -454,13 +466,30 @@ unsafe extern "system" fn window_proc(
             }
             match result.records {
                 Ok(records) => {
-                    state.records = records;
-                    state.result_sorter.invalidate();
+                    replace_records(state, records);
                     state.last_search = None;
                     unsafe { refresh_results(state) };
+                    request_background_sort(window, state);
                 }
                 Err(error) => unsafe { set_status(state, &error) },
             }
+            0
+        }
+        WM_SORT_READY if !state_ptr.is_null() => {
+            let result = unsafe { Box::from_raw(lparam as *mut SortResult) };
+            let state = unsafe { &mut *state_ptr };
+            state.sort_in_progress = false;
+            if result.records_generation == state.records_generation
+                && result.column == state.sort_column
+            {
+                state.result_sorter.install(result.column, result.order);
+                sort_results(state, false);
+                unsafe {
+                    SendMessageW(state.list, LVM_SETITEMCOUNT, state.visible.len(), 0);
+                    set_object_status(state, state.visible.len());
+                }
+            }
+            request_background_sort(window, state);
             0
         }
         WM_OPTIONS_APPLIED if !state_ptr.is_null() => {
@@ -480,7 +509,7 @@ unsafe extern "system" fn window_proc(
                 state.monitor_generation = state.monitor_generation.wrapping_add(1);
                 state.monitor = None;
                 state.loading = true;
-                state.records.clear();
+                replace_records(state, Vec::new());
                 state.visible.clear();
                 state.last_search = None;
                 unsafe {
@@ -537,7 +566,9 @@ unsafe fn handle_notification(window: HWND, state: &mut AppState, lparam: LPARAM
             } else {
                 state.sort_column = column;
                 state.sort_ascending = true;
-                sort_results(state, false);
+                if !sort_results(state, false) {
+                    request_background_sort(window, state);
+                }
             }
             unsafe { SendMessageW(state.list, LVM_SETITEMCOUNT, state.visible.len(), 0) };
         }
@@ -695,7 +726,15 @@ unsafe fn refresh_results(state: &mut AppState) {
     }
 }
 
-fn sort_results(state: &mut AppState, already_default_sorted: bool) {
+fn sort_results(state: &mut AppState, already_default_sorted: bool) -> bool {
+    if state.sort_column != 0
+        && state
+            .result_sorter
+            .ordered_indices(state.sort_column)
+            .is_none()
+    {
+        return false;
+    }
     state.result_sorter.sort(
         &state.records,
         &mut state.visible,
@@ -703,6 +742,45 @@ fn sort_results(state: &mut AppState, already_default_sorted: bool) {
         state.sort_ascending,
         already_default_sorted,
     );
+    true
+}
+
+fn replace_records(state: &mut AppState, records: Vec<FileRecord>) {
+    state.records = Arc::new(records);
+    state.records_generation = state.records_generation.wrapping_add(1);
+    state.result_sorter.invalidate();
+}
+
+fn request_background_sort(window: HWND, state: &mut AppState) {
+    if state.loading
+        || state.sort_column == 0
+        || state.sort_in_progress
+        || state
+            .result_sorter
+            .ordered_indices(state.sort_column)
+            .is_some()
+    {
+        return;
+    }
+
+    state.sort_in_progress = true;
+    let records = Arc::clone(&state.records);
+    let records_generation = state.records_generation;
+    let column = state.sort_column;
+    let order_storage = state.result_sorter.take_order_storage();
+    let window_value = window as usize;
+    unsafe { set_status(state, "Sorting...") };
+    thread::spawn(move || {
+        let result = Box::new(SortResult {
+            records_generation,
+            column,
+            order: ResultSorter::build_order_reusing(&records, column, order_storage),
+        });
+        let result = Box::into_raw(result);
+        if unsafe { PostMessageW(window_value as HWND, WM_SORT_READY, 0, result as isize) } == 0 {
+            unsafe { drop(Box::from_raw(result)) };
+        }
+    });
 }
 
 fn is_simple_search(search: &str) -> bool {

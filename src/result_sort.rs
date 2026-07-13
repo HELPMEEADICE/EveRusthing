@@ -20,6 +20,36 @@ impl ResultSorter {
         (self.cached_column == Some(column)).then_some(self.cached_order.as_slice())
     }
 
+    pub(crate) fn install(&mut self, column: usize, order: Vec<u32>) {
+        self.cached_column = Some(column);
+        self.cached_order = order;
+    }
+
+    pub(crate) fn build_order(records: &[FileRecord], column: usize) -> Vec<u32> {
+        Self::build_order_reusing(records, column, Vec::new())
+    }
+
+    pub(crate) fn take_order_storage(&mut self) -> Vec<u32> {
+        self.cached_column = None;
+        std::mem::take(&mut self.cached_order)
+    }
+
+    pub(crate) fn build_order_reusing(
+        records: &[FileRecord],
+        column: usize,
+        mut order: Vec<u32>,
+    ) -> Vec<u32> {
+        order.clear();
+        order.extend(0..records.len() as u32);
+        match column {
+            1 => sort_parent_paths(records, &mut order),
+            _ => order.sort_unstable_by(|left, right| {
+                compare_records(&records[*left as usize], &records[*right as usize], column)
+            }),
+        }
+        order
+    }
+
     pub(crate) fn sort(
         &mut self,
         records: &[FileRecord],
@@ -33,12 +63,7 @@ impl ResultSorter {
         } else if self.cached_column == Some(column) {
             apply_cached_order(visible, &self.cached_order, records.len());
         } else if should_cache_sort(visible.len(), records.len()) {
-            self.cached_order.clear();
-            self.cached_order.extend(0..records.len() as u32);
-            self.cached_order.sort_unstable_by(|left, right| {
-                compare_records(&records[*left as usize], &records[*right as usize], column)
-            });
-            self.cached_column = Some(column);
+            self.install(column, Self::build_order(records, column));
             apply_cached_order(visible, &self.cached_order, records.len());
         } else {
             visible.sort_unstable_by(|left, right| {
@@ -50,6 +75,21 @@ impl ResultSorter {
             visible.reverse();
         }
     }
+}
+
+fn sort_parent_paths(records: &[FileRecord], order: &mut [u32]) {
+    let parent_lengths: Vec<u32> = records
+        .iter()
+        .map(|record| record.parent_path().len() as u32)
+        .collect();
+    order.sort_unstable_by(|left, right| {
+        let left_record = &records[*left as usize];
+        let right_record = &records[*right as usize];
+        let left_parent = &left_record.path[..parent_lengths[*left as usize] as usize];
+        let right_parent = &right_record.path[..parent_lengths[*right as usize] as usize];
+        crate::database::compare_ascii_case_insensitive(left_parent, right_parent)
+            .then_with(|| left_record.path.cmp(&right_record.path))
+    });
 }
 
 fn should_cache_sort(visible_count: usize, record_count: usize) -> bool {
@@ -183,5 +223,99 @@ mod tests {
         assert!(sorter.ordered_indices(3).is_some());
         sorter.invalidate();
         assert!(sorter.ordered_indices(3).is_none());
+    }
+
+    #[test]
+    fn optimized_builders_match_comparison_sort_for_every_column() {
+        let mut records = Vec::new();
+        for index in 0..2_000_u64 {
+            records.push(FileRecord {
+                path: format!(
+                    r"C:\group-{}\item-{:04}.dat",
+                    index.wrapping_mul(47) % 31,
+                    2_000 - index
+                ),
+                size: (index % 7 != 0)
+                    .then_some(index.wrapping_mul(97) % 53)
+                    .into(),
+                date_modified: (index % 11 != 0)
+                    .then_some(index.wrapping_mul(193) % 101)
+                    .into(),
+                ..FileRecord::default()
+            });
+        }
+
+        for column in 1..=3 {
+            let mut expected: Vec<_> = (0..records.len() as u32).collect();
+            expected.sort_unstable_by(|left, right| {
+                compare_records_legacy(&records[*left as usize], &records[*right as usize], column)
+            });
+            assert_eq!(ResultSorter::build_order(&records, column), expected);
+        }
+    }
+
+    #[test]
+    #[ignore = "release-only performance probe"]
+    fn benchmark_full_sort_builders() {
+        use std::time::Instant;
+
+        let records: Vec<_> = (0..500_000_u64)
+            .map(|index| FileRecord {
+                path: format!(
+                    r"C:\group-{:05}\item-{:07}.dat",
+                    index.wrapping_mul(47_123) % 100_003,
+                    index
+                ),
+                size: (index % 13 != 0)
+                    .then_some(index.wrapping_mul(97_531) % 10_000_019)
+                    .into(),
+                date_modified: (index % 17 != 0)
+                    .then_some(index.wrapping_mul(1_000_003) % 1_000_000_007)
+                    .into(),
+                ..FileRecord::default()
+            })
+            .collect();
+
+        let mut storage = Vec::new();
+        for (column, name) in [(1, "Path"), (2, "Size"), (3, "Date Modified")] {
+            let comparison = (column == 1).then(|| {
+                let mut expected: Vec<_> = (0..records.len() as u32).collect();
+                let start = Instant::now();
+                expected.sort_unstable_by(|left, right| {
+                    compare_records_legacy(
+                        &records[*left as usize],
+                        &records[*right as usize],
+                        column,
+                    )
+                });
+                (start.elapsed(), expected)
+            });
+
+            let start = Instant::now();
+            storage = ResultSorter::build_order_reusing(&records, column, storage);
+            let optimized_elapsed = start.elapsed();
+            if let Some((comparison_elapsed, expected)) = comparison {
+                assert_eq!(storage, expected);
+                println!(
+                    "{name}: comparison={comparison_elapsed:?}, optimized={optimized_elapsed:?}, speedup={:.2}x",
+                    comparison_elapsed.as_secs_f64() / optimized_elapsed.as_secs_f64()
+                );
+            } else {
+                println!("{name}: background build={optimized_elapsed:?}");
+            }
+        }
+    }
+
+    fn compare_records_legacy(left: &FileRecord, right: &FileRecord, column: usize) -> Ordering {
+        match column {
+            1 => crate::database::compare_ascii_case_insensitive(
+                left.parent_path(),
+                right.parent_path(),
+            ),
+            2 => left.size.get().cmp(&right.size.get()),
+            3 => left.date_modified.get().cmp(&right.date_modified.get()),
+            _ => Ordering::Equal,
+        }
+        .then_with(|| left.path.cmp(&right.path))
     }
 }
