@@ -5,6 +5,9 @@ edition = "2024"
 description = "A Rust reimplementation of Everything 1.4.1.1032"
 license = "MIT"
 
+[build-dependencies]
+embed-resource = "3.0.11"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
