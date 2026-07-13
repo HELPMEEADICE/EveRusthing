@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -48,68 +49,81 @@ pub fn read_file(path: &Path) -> Result<Vec<FileRecord>, EfuError> {
 }
 
 pub fn write_file(path: &Path, records: &[FileRecord]) -> Result<(), EfuError> {
-    fs::write(path, write(records)).map_err(|error| EfuError::Io(error.to_string()))
+    let file = File::create(path).map_err(|error| EfuError::Io(error.to_string()))?;
+    let mut file = BufWriter::new(file);
+    write_records(&mut file, records).map_err(|error| EfuError::Io(error.to_string()))?;
+    file.flush()
+        .map_err(|error| EfuError::Io(error.to_string()))
 }
 
 pub fn parse(bytes: &[u8]) -> Result<Vec<FileRecord>, EfuError> {
     let text = std::str::from_utf8(bytes).map_err(|_| EfuError::InvalidUtf8)?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let rows = parse_csv(text)?;
-    let Some(header) = rows.first() else {
-        return Err(EfuError::MissingFilenameColumn);
-    };
-
-    let column = |name: &str| {
-        header
-            .iter()
-            .position(|value| value.eq_ignore_ascii_case(name))
-    };
-    let filename = column("Filename").ok_or(EfuError::MissingFilenameColumn)?;
-    let size = column("Size");
-    let modified = column("Date Modified");
-    let created = column("Date Created");
-    let attributes = column("Attributes");
-
-    rows.into_iter()
-        .skip(1)
-        .filter(|row| row.iter().any(|field| !field.is_empty()))
-        .map(|row| {
-            let get =
-                |index: Option<usize>| index.and_then(|index| row.get(index)).map(String::as_str);
-            Ok(FileRecord {
-                path: row.get(filename).cloned().unwrap_or_default(),
-                volume_serial: None,
-                file_reference: None,
-                parent_reference: None,
-                size: parse_optional_u64(get(size), "Size")?,
-                date_modified: parse_optional_date(get(modified))?,
-                date_created: parse_optional_date(get(created))?,
-                attributes: parse_optional_u32(get(attributes), "Attributes")?,
-                file_list_filename: None,
-            })
-        })
-        .collect()
+    let mut columns = None;
+    let mut records = Vec::new();
+    parse_csv(text, |mut row| {
+        let Some(columns) = columns else {
+            let column = |name: &str| {
+                row.iter()
+                    .position(|value| value.eq_ignore_ascii_case(name))
+            };
+            columns = Some(Columns {
+                filename: column("Filename").ok_or(EfuError::MissingFilenameColumn)?,
+                size: column("Size"),
+                modified: column("Date Modified"),
+                created: column("Date Created"),
+                attributes: column("Attributes"),
+            });
+            return Ok(());
+        };
+        if !row.iter().any(|field| !field.is_empty()) {
+            return Ok(());
+        }
+        let get = |index: Option<usize>| index.and_then(|index| row.get(index)).map(String::as_str);
+        let size = parse_optional_u64(get(columns.size), "Size")?;
+        let date_modified = parse_optional_date(get(columns.modified))?;
+        let date_created = parse_optional_date(get(columns.created))?;
+        let attributes = parse_optional_u32(get(columns.attributes), "Attributes")?;
+        let path = row
+            .get_mut(columns.filename)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        records.push(FileRecord {
+            path,
+            volume_serial: None.into(),
+            file_reference: None.into(),
+            parent_reference: None.into(),
+            size: size.into(),
+            date_modified: date_modified.into(),
+            date_created: date_created.into(),
+            attributes: attributes.into(),
+            file_list_filename: None,
+        });
+        Ok(())
+    })?;
+    columns.ok_or(EfuError::MissingFilenameColumn)?;
+    Ok(records)
 }
 
 pub fn write(records: &[FileRecord]) -> Vec<u8> {
-    let mut output = String::from("Filename,Size,Date Modified,Date Created,Attributes\r\n");
-    for record in records {
-        push_csv_field(&mut output, &record.path);
-        output.push(',');
-        push_optional(&mut output, record.size);
-        output.push(',');
-        push_optional(&mut output, record.date_modified);
-        output.push(',');
-        push_optional(&mut output, record.date_created);
-        output.push(',');
-        push_optional(&mut output, record.attributes);
-        output.push_str("\r\n");
-    }
-    output.into_bytes()
+    let mut output = Vec::new();
+    write_records(&mut output, records).expect("writing to a Vec cannot fail");
+    output
 }
 
-fn parse_csv(text: &str) -> Result<Vec<Vec<String>>, EfuError> {
-    let mut rows = Vec::new();
+#[derive(Clone, Copy)]
+struct Columns {
+    filename: usize,
+    size: Option<usize>,
+    modified: Option<usize>,
+    created: Option<usize>,
+    attributes: Option<usize>,
+}
+
+fn parse_csv(
+    text: &str,
+    mut visit: impl FnMut(Vec<String>) -> Result<(), EfuError>,
+) -> Result<(), EfuError> {
     let mut row = Vec::new();
     let mut field = String::new();
     let mut chars = text.chars().peekable();
@@ -134,7 +148,7 @@ fn parse_csv(text: &str) -> Result<Vec<Vec<String>>, EfuError> {
                     chars.next();
                 }
                 row.push(std::mem::take(&mut field));
-                rows.push(std::mem::take(&mut row));
+                visit(std::mem::take(&mut row))?;
                 field_start = true;
             }
             _ => {
@@ -149,9 +163,9 @@ fn parse_csv(text: &str) -> Result<Vec<Vec<String>>, EfuError> {
     }
     if !field.is_empty() || !row.is_empty() {
         row.push(field);
-        rows.push(row);
+        visit(row)?;
     }
-    Ok(rows)
+    Ok(())
 }
 
 fn parse_optional_u64(value: Option<&str>, column: &str) -> Result<Option<u64>, EfuError> {
@@ -270,20 +284,45 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
-fn push_optional<T: Display>(output: &mut String, value: Option<T>) {
-    if let Some(value) = value {
-        output.push_str(&value.to_string());
+fn write_records(output: &mut impl Write, records: &[FileRecord]) -> std::io::Result<()> {
+    output.write_all(b"Filename,Size,Date Modified,Date Created,Attributes\r\n")?;
+    for record in records {
+        write_csv_field(output, &record.path)?;
+        output.write_all(b",")?;
+        write_optional(output, record.size.get())?;
+        output.write_all(b",")?;
+        write_optional(output, record.date_modified.get())?;
+        output.write_all(b",")?;
+        write_optional(output, record.date_created.get())?;
+        output.write_all(b",")?;
+        write_optional(output, record.attributes.get())?;
+        output.write_all(b"\r\n")?;
     }
+    Ok(())
 }
 
-fn push_csv_field(output: &mut String, value: &str) {
-    if value.contains([',', '"', '\r', '\n']) {
-        output.push('"');
-        output.push_str(&value.replace('"', "\"\""));
-        output.push('"');
-    } else {
-        output.push_str(value);
+fn write_optional<T: Display>(output: &mut impl Write, value: Option<T>) -> std::io::Result<()> {
+    if let Some(value) = value {
+        write!(output, "{value}")?;
     }
+    Ok(())
+}
+
+fn write_csv_field(output: &mut impl Write, value: &str) -> std::io::Result<()> {
+    if value.contains([',', '"', '\r', '\n']) {
+        output.write_all(b"\"")?;
+        let mut rest = value.as_bytes();
+        while let Some(index) = rest.iter().position(|byte| *byte == b'"') {
+            output.write_all(&rest[..index])?;
+            output.write_all(b"\"\"")?;
+            rest = &rest[index + 1..];
+        }
+        output.write_all(rest)?;
+        output.write_all(b"\"")?;
+    } else {
+        output.write_all(value.as_bytes())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -311,13 +350,13 @@ mod tests {
     fn written_records_round_trip() {
         let records = vec![FileRecord {
             path: "C:\\comma,name\\quote\".txt".into(),
-            volume_serial: None,
-            file_reference: None,
-            parent_reference: None,
-            size: Some(123),
-            date_modified: Some(456),
-            date_created: None,
-            attributes: Some(32),
+            volume_serial: None.into(),
+            file_reference: None.into(),
+            parent_reference: None.into(),
+            size: Some(123).into(),
+            date_modified: Some(456).into(),
+            date_created: None.into(),
+            attributes: Some(32).into(),
             file_list_filename: Some("ignored.efu".into()),
         }];
 

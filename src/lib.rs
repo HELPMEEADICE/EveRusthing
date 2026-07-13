@@ -16,4 +16,4 @@ pub mod ntfs;
 #[cfg(windows)]
 pub mod service;
 
-pub use model::FileRecord;
+pub use model::{FileRecord, OptionalU32, OptionalU64};

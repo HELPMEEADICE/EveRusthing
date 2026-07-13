@@ -1,6 +1,6 @@
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::model::FileRecord;
@@ -63,44 +63,55 @@ pub fn read(path: &Path) -> Result<DatabaseSnapshot, DatabaseError> {
         return Err(DatabaseError::Corrupt("invalid file size"));
     }
 
-    let mut bytes = Vec::with_capacity(length as usize);
-    file.read_to_end(&mut bytes).map_err(DatabaseError::Io)?;
-    let mut decoder = Decoder::new(&bytes);
-    if decoder.take(MAGIC.len())? != MAGIC {
+    let mut header = [0u8; HEADER_SIZE];
+    file.read_exact(&mut header).map_err(DatabaseError::Io)?;
+    if &header[..MAGIC.len()] != MAGIC {
         return Err(DatabaseError::Corrupt("invalid magic"));
     }
-    if decoder.u32()? != VERSION {
+    if u32::from_le_bytes(header[8..12].try_into().unwrap()) != VERSION {
         return Err(DatabaseError::Corrupt("unsupported version"));
     }
-    let payload_size = usize::try_from(decoder.u64()?)
+    let payload_size = usize::try_from(u64::from_le_bytes(header[12..20].try_into().unwrap()))
         .map_err(|_| DatabaseError::Corrupt("payload is too large"))?;
-    let expected_checksum = decoder.u64()?;
-    if payload_size != decoder.remaining() {
+    let expected_checksum = u64::from_le_bytes(header[20..28].try_into().unwrap());
+    if payload_size as u64 != length - HEADER_SIZE as u64 {
         return Err(DatabaseError::Corrupt("payload length mismatch"));
     }
-    let payload = decoder.take(payload_size)?;
-    if checksum(payload) != expected_checksum {
+    let mut decoder = Decoder::new(file, payload_size);
+    let snapshot = decode_snapshot(&mut decoder)?;
+    if decoder.remaining() != 0 {
+        return Err(DatabaseError::Corrupt("trailing payload data"));
+    }
+    if decoder.checksum != expected_checksum {
         return Err(DatabaseError::Corrupt("checksum mismatch"));
     }
-    decode_snapshot(payload)
+    Ok(snapshot)
 }
 
 pub fn write(path: &Path, snapshot: &DatabaseSnapshot) -> Result<(), DatabaseError> {
-    let payload = encode_snapshot(snapshot)?;
-    let payload_size =
-        u64::try_from(payload.len()).map_err(|_| DatabaseError::Corrupt("payload is too large"))?;
-    let mut header = Vec::with_capacity(HEADER_SIZE);
-    header.extend_from_slice(MAGIC);
-    header.extend_from_slice(&VERSION.to_le_bytes());
-    header.extend_from_slice(&payload_size.to_le_bytes());
-    header.extend_from_slice(&checksum(&payload).to_le_bytes());
-
     let temporary = temporary_path(path);
     let result = (|| {
-        let mut file = File::create(&temporary).map_err(DatabaseError::Io)?;
+        let file = File::create(&temporary).map_err(DatabaseError::Io)?;
+        let mut file = BufWriter::new(file);
+        file.write_all(&[0; HEADER_SIZE])
+            .map_err(DatabaseError::Io)?;
+        let (payload_size, payload_checksum) = {
+            let mut encoder = Encoder::new(&mut file);
+            encode_snapshot(&mut encoder, snapshot)?;
+            (encoder.written, encoder.checksum)
+        };
+        if payload_size > MAX_DATABASE_SIZE - HEADER_SIZE as u64 {
+            return Err(DatabaseError::Corrupt("payload is too large"));
+        }
+        let mut header = [0u8; HEADER_SIZE];
+        header[..8].copy_from_slice(MAGIC);
+        header[8..12].copy_from_slice(&VERSION.to_le_bytes());
+        header[12..20].copy_from_slice(&payload_size.to_le_bytes());
+        header[20..28].copy_from_slice(&payload_checksum.to_le_bytes());
+        file.seek(SeekFrom::Start(0)).map_err(DatabaseError::Io)?;
         file.write_all(&header).map_err(DatabaseError::Io)?;
-        file.write_all(&payload).map_err(DatabaseError::Io)?;
-        file.sync_all().map_err(DatabaseError::Io)?;
+        file.flush().map_err(DatabaseError::Io)?;
+        file.get_ref().sync_all().map_err(DatabaseError::Io)?;
         drop(file);
         replace_file(&temporary, path).map_err(DatabaseError::Io)
     })();
@@ -225,7 +236,7 @@ fn refresh_direct(
         checkpoint.next_usn =
             volume.catch_up(&index, checkpoint.next_usn, checkpoint.journal_id)?;
     }
-    snapshot.records = index.snapshot();
+    snapshot.records = index.snapshot_unsorted();
     Ok(snapshot)
 }
 
@@ -278,7 +289,7 @@ fn refresh_through_service(
         .map_err(|error| error.to_string())?;
         checkpoint.next_usn = reply.next_usn;
     }
-    snapshot.records = index.snapshot();
+    snapshot.records = index.snapshot_unsorted();
     Ok(snapshot)
 }
 
@@ -302,7 +313,7 @@ fn build_direct() -> Result<DatabaseSnapshot, crate::ntfs::NtfsError> {
         });
     }
     Ok(DatabaseSnapshot {
-        records: index.snapshot(),
+        records: index.snapshot_unsorted(),
         volumes,
     })
 }
@@ -355,35 +366,39 @@ pub fn sort_records(records: &mut [FileRecord]) {
     });
 }
 
-fn encode_snapshot(snapshot: &DatabaseSnapshot) -> Result<Vec<u8>, DatabaseError> {
+fn encode_snapshot(
+    output: &mut Encoder<impl Write>,
+    snapshot: &DatabaseSnapshot,
+) -> Result<(), DatabaseError> {
     if snapshot.records.len() > MAX_RECORDS {
         return Err(DatabaseError::Corrupt("too many records"));
     }
-    let mut output = Vec::new();
-    output.extend_from_slice(&(snapshot.volumes.len() as u32).to_le_bytes());
+    if snapshot.volumes.len() > 26 {
+        return Err(DatabaseError::Corrupt("too many volumes"));
+    }
+    output.u32(snapshot.volumes.len() as u32)?;
     for volume in &snapshot.volumes {
-        output.extend_from_slice(&volume.volume_serial.to_le_bytes());
-        output.extend_from_slice(&volume.root_file_reference.to_le_bytes());
-        output.extend_from_slice(&volume.journal_id.to_le_bytes());
-        output.extend_from_slice(&volume.next_usn.to_le_bytes());
-        push_string(&mut output, &volume.root)?;
+        output.u64(volume.volume_serial)?;
+        output.u64(volume.root_file_reference)?;
+        output.u64(volume.journal_id)?;
+        output.i64(volume.next_usn)?;
+        output.string(&volume.root)?;
     }
-    output.extend_from_slice(&(snapshot.records.len() as u64).to_le_bytes());
+    output.u64(snapshot.records.len() as u64)?;
     for record in &snapshot.records {
-        output.extend_from_slice(&record.volume_serial.unwrap_or(NONE_U64).to_le_bytes());
-        output.extend_from_slice(&record.file_reference.unwrap_or(NONE_U64).to_le_bytes());
-        output.extend_from_slice(&record.parent_reference.unwrap_or(NONE_U64).to_le_bytes());
-        output.extend_from_slice(&record.size.unwrap_or(NONE_U64).to_le_bytes());
-        output.extend_from_slice(&record.date_modified.unwrap_or(NONE_U64).to_le_bytes());
-        output.extend_from_slice(&record.date_created.unwrap_or(NONE_U64).to_le_bytes());
-        output.extend_from_slice(&record.attributes.unwrap_or(NONE_U32).to_le_bytes());
-        push_string(&mut output, &record.path)?;
+        output.u64(record.volume_serial.unwrap_or(NONE_U64))?;
+        output.u64(record.file_reference.unwrap_or(NONE_U64))?;
+        output.u64(record.parent_reference.unwrap_or(NONE_U64))?;
+        output.u64(record.size.unwrap_or(NONE_U64))?;
+        output.u64(record.date_modified.unwrap_or(NONE_U64))?;
+        output.u64(record.date_created.unwrap_or(NONE_U64))?;
+        output.u32(record.attributes.unwrap_or(NONE_U32))?;
+        output.string(&record.path)?;
     }
-    Ok(output)
+    Ok(())
 }
 
-fn decode_snapshot(payload: &[u8]) -> Result<DatabaseSnapshot, DatabaseError> {
-    let mut decoder = Decoder::new(payload);
+fn decode_snapshot(decoder: &mut Decoder<impl Read>) -> Result<DatabaseSnapshot, DatabaseError> {
     let volume_count = decoder.u32()? as usize;
     if volume_count > 26 || volume_count > decoder.remaining() / 36 {
         return Err(DatabaseError::Corrupt("invalid volume count"));
@@ -406,36 +421,18 @@ fn decode_snapshot(payload: &[u8]) -> Result<DatabaseSnapshot, DatabaseError> {
     let mut records = Vec::with_capacity(count);
     for _ in 0..count {
         records.push(FileRecord {
-            volume_serial: optional_u64(decoder.u64()?),
-            file_reference: optional_u64(decoder.u64()?),
-            parent_reference: optional_u64(decoder.u64()?),
-            size: optional_u64(decoder.u64()?),
-            date_modified: optional_u64(decoder.u64()?),
-            date_created: optional_u64(decoder.u64()?),
-            attributes: optional_u32(decoder.u32()?),
+            volume_serial: optional_u64(decoder.u64()?).into(),
+            file_reference: optional_u64(decoder.u64()?).into(),
+            parent_reference: optional_u64(decoder.u64()?).into(),
+            size: optional_u64(decoder.u64()?).into(),
+            date_modified: optional_u64(decoder.u64()?).into(),
+            date_created: optional_u64(decoder.u64()?).into(),
+            attributes: optional_u32(decoder.u32()?).into(),
             path: decoder.string()?,
             file_list_filename: None,
         });
     }
-    if decoder.remaining() != 0 {
-        return Err(DatabaseError::Corrupt("trailing payload data"));
-    }
     Ok(DatabaseSnapshot { records, volumes })
-}
-
-fn push_string(output: &mut Vec<u8>, value: &str) -> Result<(), DatabaseError> {
-    if value.len() > MAX_STRING_SIZE {
-        return Err(DatabaseError::Corrupt("path is too long"));
-    }
-    output.extend_from_slice(&(value.len() as u32).to_le_bytes());
-    output.extend_from_slice(value.as_bytes());
-    Ok(())
-}
-
-fn checksum(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(FNV_OFFSET, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
-    })
 }
 
 pub(crate) fn compare_ascii_case_insensitive(left: &str, right: &str) -> std::cmp::Ordering {
@@ -486,43 +483,97 @@ fn optional_u32(value: u32) -> Option<u32> {
     (value != NONE_U32).then_some(value)
 }
 
-struct Decoder<'a> {
-    bytes: &'a [u8],
-    offset: usize,
+struct Encoder<W> {
+    writer: W,
+    written: u64,
+    checksum: u64,
 }
 
-impl<'a> Decoder<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
+impl<W: Write> Encoder<W> {
+    fn new(writer: W) -> Self {
+        Self {
+            writer,
+            written: 0,
+            checksum: FNV_OFFSET,
+        }
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) -> Result<(), DatabaseError> {
+        self.writer.write_all(bytes).map_err(DatabaseError::Io)?;
+        self.written = self
+            .written
+            .checked_add(bytes.len() as u64)
+            .ok_or(DatabaseError::Corrupt("payload is too large"))?;
+        update_checksum(&mut self.checksum, bytes);
+        Ok(())
+    }
+
+    fn u32(&mut self, value: u32) -> Result<(), DatabaseError> {
+        self.bytes(&value.to_le_bytes())
+    }
+
+    fn u64(&mut self, value: u64) -> Result<(), DatabaseError> {
+        self.bytes(&value.to_le_bytes())
+    }
+
+    fn i64(&mut self, value: i64) -> Result<(), DatabaseError> {
+        self.bytes(&value.to_le_bytes())
+    }
+
+    fn string(&mut self, value: &str) -> Result<(), DatabaseError> {
+        if value.len() > MAX_STRING_SIZE {
+            return Err(DatabaseError::Corrupt("path is too long"));
+        }
+        self.u32(value.len() as u32)?;
+        self.bytes(value.as_bytes())
+    }
+}
+
+struct Decoder<R> {
+    reader: R,
+    remaining: usize,
+    checksum: u64,
+}
+
+impl<R: Read> Decoder<R> {
+    fn new(reader: R, remaining: usize) -> Self {
+        Self {
+            reader,
+            remaining,
+            checksum: FNV_OFFSET,
+        }
     }
 
     fn remaining(&self) -> usize {
-        self.bytes.len() - self.offset
+        self.remaining
     }
 
-    fn take(&mut self, count: usize) -> Result<&'a [u8], DatabaseError> {
-        let end = self
-            .offset
-            .checked_add(count)
-            .ok_or(DatabaseError::Corrupt("length overflow"))?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or(DatabaseError::Corrupt("unexpected end of file"))?;
-        self.offset = end;
-        Ok(value)
+    fn bytes(&mut self, output: &mut [u8]) -> Result<(), DatabaseError> {
+        if output.len() > self.remaining {
+            return Err(DatabaseError::Corrupt("unexpected end of file"));
+        }
+        self.reader.read_exact(output).map_err(DatabaseError::Io)?;
+        self.remaining -= output.len();
+        update_checksum(&mut self.checksum, output);
+        Ok(())
     }
 
     fn u32(&mut self) -> Result<u32, DatabaseError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        let mut bytes = [0; 4];
+        self.bytes(&mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
     }
 
     fn u64(&mut self) -> Result<u64, DatabaseError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        let mut bytes = [0; 8];
+        self.bytes(&mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
     }
 
     fn i64(&mut self) -> Result<i64, DatabaseError> {
-        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        let mut bytes = [0; 8];
+        self.bytes(&mut bytes)?;
+        Ok(i64::from_le_bytes(bytes))
     }
 
     fn string(&mut self) -> Result<String, DatabaseError> {
@@ -530,8 +581,15 @@ impl<'a> Decoder<'a> {
         if length > MAX_STRING_SIZE {
             return Err(DatabaseError::Corrupt("path is too long"));
         }
-        String::from_utf8(self.take(length)?.to_vec())
-            .map_err(|_| DatabaseError::Corrupt("path is not UTF-8"))
+        let mut bytes = vec![0; length];
+        self.bytes(&mut bytes)?;
+        String::from_utf8(bytes).map_err(|_| DatabaseError::Corrupt("path is not UTF-8"))
+    }
+}
+
+fn update_checksum(checksum: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *checksum = (*checksum ^ u64::from(*byte)).wrapping_mul(FNV_PRIME);
     }
 }
 
@@ -554,13 +612,13 @@ mod tests {
     fn record(path: &str) -> FileRecord {
         FileRecord {
             path: path.into(),
-            volume_serial: Some(12),
-            file_reference: Some(34),
-            parent_reference: Some(5),
-            size: Some(56),
-            date_modified: Some(78),
-            date_created: Some(90),
-            attributes: Some(0x20),
+            volume_serial: Some(12).into(),
+            file_reference: Some(34).into(),
+            parent_reference: Some(5).into(),
+            size: Some(56).into(),
+            date_modified: Some(78).into(),
+            date_created: Some(90).into(),
+            attributes: Some(0x20).into(),
             file_list_filename: None,
         }
     }

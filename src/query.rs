@@ -13,16 +13,63 @@ pub struct QueryOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Query {
     root: Expression,
-    options: QueryOptions,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Expression {
     All,
-    Term(String),
+    Term(CompiledTerm),
     Not(Box<Expression>),
     And(Vec<Expression>),
     Or(Vec<Expression>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CompiledTerm {
+    Text(TextPattern),
+    Extension {
+        values: Vec<String>,
+        match_case: bool,
+    },
+    File(Option<TextPattern>),
+    Directory(Option<TextPattern>),
+    Parent {
+        value: String,
+        match_case: bool,
+    },
+    FileReference(Option<u64>),
+    Size(Option<SizeComparison>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TextPattern {
+    value: String,
+    kind: PatternKind,
+    target: TextTarget,
+    match_case: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PatternKind {
+    Contains,
+    WholeWord,
+    Wildcard,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TextTarget {
+    Automatic,
+    Path,
+    Name,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SizeComparison {
+    Equal(u64),
+    Greater(u64),
+    GreaterOrEqual(u64),
+    Less(u64),
+    LessOrEqual(u64),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,22 +108,22 @@ impl Query {
         if tokens.is_empty() {
             return Ok(Self {
                 root: Expression::All,
-                options,
             });
         }
         let mut parser = Parser {
             tokens,
             position: 0,
+            options,
         };
         let root = parser.parse_and()?;
         if parser.position != parser.tokens.len() {
             return Err(QueryError::new("unexpected token at end of search"));
         }
-        Ok(Self { root, options })
+        Ok(Self { root })
     }
 
     pub fn matches(&self, record: &FileRecord) -> bool {
-        matches_expression(&self.root, record, self.options)
+        matches_expression(&self.root, record)
     }
 
     pub fn filter<'a>(&self, records: &'a [FileRecord]) -> Vec<&'a FileRecord> {
@@ -90,6 +137,7 @@ impl Query {
 struct Parser {
     tokens: Vec<Token>,
     position: usize,
+    options: QueryOptions,
 }
 
 impl Parser {
@@ -127,7 +175,7 @@ impl Parser {
         match self.tokens.get(self.position).cloned() {
             Some(Token::Term(term)) => {
                 self.position += 1;
-                Ok(Expression::Term(term))
+                Ok(Expression::Term(compile_term(&term, self.options)))
             }
             Some(Token::Open) => {
                 self.position += 1;
@@ -253,92 +301,147 @@ fn decode_character_entities(term: &str) -> String {
     output
 }
 
-fn matches_expression(expression: &Expression, record: &FileRecord, options: QueryOptions) -> bool {
+fn matches_expression(expression: &Expression, record: &FileRecord) -> bool {
     match expression {
         Expression::All => true,
-        Expression::Term(term) => matches_term(term, record, options),
-        Expression::Not(expression) => !matches_expression(expression, record, options),
+        Expression::Term(term) => matches_term(term, record),
+        Expression::Not(expression) => !matches_expression(expression, record),
         Expression::And(expressions) => expressions
             .iter()
-            .all(|expression| matches_expression(expression, record, options)),
+            .all(|expression| matches_expression(expression, record)),
         Expression::Or(expressions) => expressions
             .iter()
-            .any(|expression| matches_expression(expression, record, options)),
+            .any(|expression| matches_expression(expression, record)),
     }
 }
 
-fn matches_term(term: &str, record: &FileRecord, mut options: QueryOptions) -> bool {
+fn compile_term(term: &str, mut options: QueryOptions) -> CompiledTerm {
     let Some((prefix, value)) = term.split_once(':') else {
-        return matches_text(record, term, options);
+        return CompiledTerm::Text(compile_text(term, options, TextTarget::Automatic));
     };
     if prefix.eq_ignore_ascii_case("case") {
         options.match_case = true;
-        matches_term(value, record, options)
+        compile_term(value, options)
     } else if prefix.eq_ignore_ascii_case("nocase") {
         options.match_case = false;
-        matches_term(value, record, options)
+        compile_term(value, options)
     } else if prefix.eq_ignore_ascii_case("wholeword") || prefix.eq_ignore_ascii_case("ww") {
         options.match_whole_word = true;
-        matches_term(value, record, options)
+        compile_term(value, options)
     } else if prefix.eq_ignore_ascii_case("nowholeword") || prefix.eq_ignore_ascii_case("noww") {
         options.match_whole_word = false;
-        matches_term(value, record, options)
+        compile_term(value, options)
     } else if prefix.eq_ignore_ascii_case("path") {
         options.match_path = true;
-        matches_text(record, value, options)
+        CompiledTerm::Text(compile_text(value, options, TextTarget::Path))
     } else if prefix.eq_ignore_ascii_case("nopath") {
         options.match_path = false;
-        matches_text(record, value, options)
+        CompiledTerm::Text(compile_text(value, options, TextTarget::Name))
     } else if prefix.eq_ignore_ascii_case("name") {
-        match_pattern(record.file_name(), value, options)
+        CompiledTerm::Text(compile_text(value, options, TextTarget::Name))
     } else if prefix.eq_ignore_ascii_case("ext") {
-        value.split(';').any(|extension| {
-            equals(
-                record.extension(),
-                extension.trim_start_matches('.'),
-                options.match_case,
-            )
-        })
+        CompiledTerm::Extension {
+            values: value
+                .split(';')
+                .map(|extension| extension.trim_start_matches('.').to_owned())
+                .collect(),
+            match_case: options.match_case,
+        }
     } else if prefix.eq_ignore_ascii_case("file") {
-        !record.is_directory() && (value.is_empty() || matches_text(record, value, options))
-    } else if prefix.eq_ignore_ascii_case("folder") || prefix.eq_ignore_ascii_case("dir") {
-        record.is_directory() && (value.is_empty() || matches_text(record, value, options))
-    } else if prefix.eq_ignore_ascii_case("parent") {
-        equals(
-            record.parent_path().trim_end_matches(['\\', '/']),
-            value.trim_end_matches(['\\', '/']),
-            options.match_case,
+        CompiledTerm::File(
+            (!value.is_empty()).then(|| compile_text(value, options, TextTarget::Automatic)),
         )
+    } else if prefix.eq_ignore_ascii_case("folder") || prefix.eq_ignore_ascii_case("dir") {
+        CompiledTerm::Directory(
+            (!value.is_empty()).then(|| compile_text(value, options, TextTarget::Automatic)),
+        )
+    } else if prefix.eq_ignore_ascii_case("parent") {
+        CompiledTerm::Parent {
+            value: value.trim_end_matches(['\\', '/']).to_owned(),
+            match_case: options.match_case,
+        }
     } else if prefix.eq_ignore_ascii_case("frn") {
-        value
-            .parse::<u64>()
-            .ok()
-            .is_some_and(|expected| record.file_reference == Some(expected))
+        CompiledTerm::FileReference(value.parse().ok())
     } else if prefix.eq_ignore_ascii_case("size") {
-        matches_size(record.size, value)
+        CompiledTerm::Size(compile_size(value))
     } else {
-        matches_text(record, term, options)
+        CompiledTerm::Text(compile_text(term, options, TextTarget::Automatic))
     }
 }
 
-fn matches_text(record: &FileRecord, pattern: &str, options: QueryOptions) -> bool {
-    let contains_separator = pattern.contains(['\\', '/']);
-    let candidate = if options.match_path || contains_separator {
-        record.path.as_str()
+fn compile_text(value: &str, options: QueryOptions, mut target: TextTarget) -> TextPattern {
+    if target == TextTarget::Automatic
+        && (options.match_path
+            || value
+                .as_bytes()
+                .iter()
+                .any(|byte| matches!(byte, b'\\' | b'/')))
+    {
+        target = TextTarget::Path;
+    }
+    let kind = if value
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b'*' | b'?'))
+    {
+        PatternKind::Wildcard
+    } else if options.match_whole_word {
+        PatternKind::WholeWord
     } else {
-        record.file_name()
+        PatternKind::Contains
     };
-    match_pattern(candidate, pattern, options)
+    TextPattern {
+        value: value.to_owned(),
+        kind,
+        target,
+        match_case: options.match_case,
+    }
 }
 
-fn match_pattern(candidate: &str, pattern: &str, options: QueryOptions) -> bool {
-    if pattern.contains(['*', '?']) {
-        return wildcard_match(candidate, pattern, options.match_case);
+fn matches_term(term: &CompiledTerm, record: &FileRecord) -> bool {
+    match term {
+        CompiledTerm::Text(pattern) => matches_text(pattern, record),
+        CompiledTerm::Extension { values, match_case } => values
+            .iter()
+            .any(|value| equals(record.extension(), value, *match_case)),
+        CompiledTerm::File(pattern) => {
+            !record.is_directory()
+                && pattern
+                    .as_ref()
+                    .is_none_or(|pattern| matches_text(pattern, record))
+        }
+        CompiledTerm::Directory(pattern) => {
+            record.is_directory()
+                && pattern
+                    .as_ref()
+                    .is_none_or(|pattern| matches_text(pattern, record))
+        }
+        CompiledTerm::Parent { value, match_case } => equals(
+            record.parent_path().trim_end_matches(['\\', '/']),
+            value,
+            *match_case,
+        ),
+        CompiledTerm::FileReference(expected) => {
+            expected.is_some_and(|expected| record.file_reference.get() == Some(expected))
+        }
+        CompiledTerm::Size(comparison) => comparison
+            .as_ref()
+            .is_some_and(|comparison| matches_size(record.size.get(), *comparison)),
     }
-    if options.match_whole_word {
-        return contains_whole_word(candidate, pattern, options.match_case);
+}
+
+fn matches_text(pattern: &TextPattern, record: &FileRecord) -> bool {
+    let candidate = match pattern.target {
+        TextTarget::Path => record.path.as_str(),
+        TextTarget::Automatic | TextTarget::Name => record.file_name(),
+    };
+    match pattern.kind {
+        PatternKind::Contains => contains(candidate, &pattern.value, pattern.match_case),
+        PatternKind::WholeWord => {
+            contains_whole_word(candidate, &pattern.value, pattern.match_case)
+        }
+        PatternKind::Wildcard => wildcard_match(candidate, &pattern.value, pattern.match_case),
     }
-    contains(candidate, pattern, options.match_case)
 }
 
 fn contains(candidate: &str, pattern: &str, case_sensitive: bool) -> bool {
@@ -522,10 +625,20 @@ fn is_separator(character: char) -> bool {
     matches!(character, '\\' | '/')
 }
 
-fn matches_size(size: Option<u64>, expression: &str) -> bool {
+fn matches_size(size: Option<u64>, comparison: SizeComparison) -> bool {
     let Some(size) = size else {
         return false;
     };
+    match comparison {
+        SizeComparison::Equal(expected) => size == expected,
+        SizeComparison::Greater(expected) => size > expected,
+        SizeComparison::GreaterOrEqual(expected) => size >= expected,
+        SizeComparison::Less(expected) => size < expected,
+        SizeComparison::LessOrEqual(expected) => size <= expected,
+    }
+}
+
+fn compile_size(expression: &str) -> Option<SizeComparison> {
     let (operator, value) = if let Some(value) = expression.strip_prefix(">=") {
         (">=", value)
     } else if let Some(value) = expression.strip_prefix("<=") {
@@ -539,16 +652,14 @@ fn matches_size(size: Option<u64>, expression: &str) -> bool {
     } else {
         ("=", expression)
     };
-    let Some(expected) = parse_size(value) else {
-        return false;
-    };
-    match operator {
-        ">=" => size >= expected,
-        "<=" => size <= expected,
-        ">" => size > expected,
-        "<" => size < expected,
-        _ => size == expected,
-    }
+    let expected = parse_size(value)?;
+    Some(match operator {
+        ">=" => SizeComparison::GreaterOrEqual(expected),
+        "<=" => SizeComparison::LessOrEqual(expected),
+        ">" => SizeComparison::Greater(expected),
+        "<" => SizeComparison::Less(expected),
+        _ => SizeComparison::Equal(expected),
+    })
 }
 
 fn parse_size(value: &str) -> Option<u64> {
@@ -581,8 +692,8 @@ mod tests {
     fn file(path: &str, size: u64) -> FileRecord {
         FileRecord {
             path: path.into(),
-            size: Some(size),
-            attributes: Some(0x20),
+            size: Some(size).into(),
+            attributes: Some(0x20).into(),
             ..FileRecord::default()
         }
     }
@@ -590,7 +701,7 @@ mod tests {
     fn folder(path: &str) -> FileRecord {
         FileRecord {
             path: path.into(),
-            attributes: Some(FILE_ATTRIBUTE_DIRECTORY),
+            attributes: Some(FILE_ATTRIBUTE_DIRECTORY).into(),
             ..FileRecord::default()
         }
     }

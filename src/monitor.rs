@@ -208,9 +208,9 @@ fn monitor_filesystem(
     notify: &impl Fn(MonitorEvent),
 ) -> Result<(), String> {
     let mut paths = HashMap::new();
-    for record in index.snapshot() {
+    for record in index.snapshot_unsorted() {
         if let (Some(volume_serial), Some(file_reference)) =
-            (record.volume_serial, record.file_reference)
+            (record.volume_serial.get(), record.file_reference.get())
         {
             paths.insert(
                 path_key(std::path::Path::new(&record.path)),
@@ -305,9 +305,9 @@ fn record_from_path(
         id: file_id(&info),
         parent_reference: parent.file_reference,
         name: path.file_name()?.to_string_lossy().into_owned(),
-        size: Some(((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64),
-        date_modified: Some(file_time_value(info.ftLastWriteTime)),
-        date_created: Some(file_time_value(info.ftCreationTime)),
+        size: Some(((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64).into(),
+        date_modified: Some(file_time_value(info.ftLastWriteTime)).into(),
+        date_created: Some(file_time_value(info.ftCreationTime)).into(),
         attributes: info.dwFileAttributes,
     })
 }
@@ -403,7 +403,7 @@ fn publish_if_changed(
         return;
     }
     let mut snapshot = DatabaseSnapshot {
-        records: index.snapshot(),
+        records: index.snapshot_unsorted(),
         volumes: checkpoints.to_vec(),
     };
     database::sort_records(&mut snapshot.records);
@@ -480,9 +480,9 @@ mod tests {
             id: root_id,
             parent_reference: root_id.file_reference,
             name: ".".into(),
-            size: Some(0),
-            date_modified: None,
-            date_created: None,
+            size: Some(0).into(),
+            date_modified: None.into(),
+            date_created: None.into(),
             attributes: root_info.dwFileAttributes,
         });
         let checkpoint = VolumeCheckpoint {

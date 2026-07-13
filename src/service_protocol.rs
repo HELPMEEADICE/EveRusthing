@@ -150,13 +150,13 @@ pub fn decode_records(bytes: &[u8]) -> Result<Vec<FileRecord>, ProtocolError> {
         let path = decoder.string()?;
         records.push(FileRecord {
             path,
-            volume_serial,
-            file_reference,
-            parent_reference,
-            size,
-            date_modified,
-            date_created,
-            attributes,
+            volume_serial: volume_serial.into(),
+            file_reference: file_reference.into(),
+            parent_reference: parent_reference.into(),
+            size: size.into(),
+            date_modified: date_modified.into(),
+            date_created: date_created.into(),
+            attributes: attributes.into(),
             file_list_filename: None,
         });
     }
@@ -341,13 +341,13 @@ mod tests {
 
         let records = vec![FileRecord {
             path: "C:\\src\\main.rs".into(),
-            volume_serial: Some(42),
-            file_reference: Some(10),
-            parent_reference: Some(5),
-            size: None,
-            date_modified: Some(20),
-            date_created: None,
-            attributes: Some(32),
+            volume_serial: Some(42).into(),
+            file_reference: Some(10).into(),
+            parent_reference: Some(5).into(),
+            size: None.into(),
+            date_modified: Some(20).into(),
+            date_created: None.into(),
+            attributes: Some(32).into(),
             file_list_filename: None,
         }];
         assert_eq!(decode_records(&encode_records(&records)).unwrap(), records);

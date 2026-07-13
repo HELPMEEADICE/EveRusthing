@@ -35,6 +35,13 @@ fn main() {
         "snapshot: {:.2} M records/s ({elapsed:?})",
         (count + 1) as f64 / elapsed.as_secs_f64() / 1_000_000.0
     );
+    let (elapsed, records) = best_of_three(|| index.snapshot_unsorted());
+    assert_eq!(records.len(), count as usize + 1);
+    black_box(records);
+    println!(
+        "unsorted production snapshot: {:.2} M records/s ({elapsed:?})",
+        (count + 1) as f64 / elapsed.as_secs_f64() / 1_000_000.0
+    );
 }
 
 fn record(frn: u64, parent: u64, name: &str, attributes: u32) -> IndexRecord {
@@ -45,9 +52,9 @@ fn record(frn: u64, parent: u64, name: &str, attributes: u32) -> IndexRecord {
         },
         parent_reference: parent,
         name: name.into(),
-        size: None,
-        date_modified: None,
-        date_created: None,
+        size: None.into(),
+        date_modified: None.into(),
+        date_created: None.into(),
         attributes,
     }
 }

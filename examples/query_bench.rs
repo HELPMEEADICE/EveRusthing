@@ -2,6 +2,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use everusthing::FileRecord;
+use everusthing::index::IndexRecord;
 use everusthing::query::{Query, QueryOptions};
 
 fn main() {
@@ -62,6 +63,16 @@ fn main() {
         "GUI result index memory: {:.2} MiB per million results (was {:.2})",
         index_memory_mib::<u32>(),
         index_memory_mib::<usize>()
+    );
+    println!(
+        "FileRecord memory: {:.2} MiB per million records (was {:.2})",
+        index_memory_mib::<FileRecord>(),
+        144.0 * 1_000_000.0 / (1024.0 * 1024.0)
+    );
+    println!(
+        "IndexRecord memory: {:.2} MiB per million records (was {:.2})",
+        index_memory_mib::<IndexRecord>(),
+        104.0 * 1_000_000.0 / (1024.0 * 1024.0)
     );
 }
 

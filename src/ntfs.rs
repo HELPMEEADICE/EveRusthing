@@ -343,17 +343,20 @@ impl NtfsVolume {
 }
 
 fn apply_usn_batch(index: &SharedIndex, volume_serial: u64, batch: &UsnBatch) {
+    let mut removals = Vec::new();
+    let mut upserts = Vec::new();
     for record in &batch.records {
         let id = FileId {
             volume_serial,
             file_reference: record.file_reference,
         };
         if record.reason & USN_REASON_FILE_DELETE != 0 {
-            index.remove(id);
+            removals.push(id);
         } else if record.reason & USN_REASON_RENAME_OLD_NAME == 0 {
-            index.upsert(to_index_record(volume_serial, record.clone()));
+            upserts.push(to_index_record(volume_serial, record.clone()));
         }
     }
+    index.apply_changes(removals, upserts);
 }
 
 pub fn apply_usn_changes(index: &SharedIndex, volume_serial: u64, batch: &UsnBatch) {
@@ -475,11 +478,12 @@ fn to_index_record(volume_serial: u64, record: UsnRecord) -> IndexRecord {
         },
         parent_reference: record.parent_reference,
         name: record.name,
-        size: None,
+        size: None.into(),
         date_modified: u64::try_from(record.timestamp)
             .ok()
-            .filter(|value| *value != 0),
-        date_created: None,
+            .filter(|value| *value != 0)
+            .into(),
+        date_created: None.into(),
         attributes: record.attributes,
     }
 }
@@ -756,7 +760,7 @@ mod tests {
                 ..parsed_record(20, 5)
             },
         );
-        original.size = Some(4096);
+        original.size = Some(4096).into();
         source.upsert(original);
 
         apply_usn_batch(

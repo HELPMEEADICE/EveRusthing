@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::model::FileRecord;
+use crate::model::{FileRecord, OptionalU64};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FileId {
@@ -14,9 +14,9 @@ pub struct IndexRecord {
     pub id: FileId,
     pub parent_reference: u64,
     pub name: String,
-    pub size: Option<u64>,
-    pub date_modified: Option<u64>,
-    pub date_created: Option<u64>,
+    pub size: OptionalU64,
+    pub date_modified: OptionalU64,
+    pub date_created: OptionalU64,
     pub attributes: u32,
 }
 
@@ -81,6 +81,12 @@ impl Index {
     }
 
     pub fn snapshot(&self) -> Vec<FileRecord> {
+        let mut output = self.snapshot_unsorted();
+        output.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        output
+    }
+
+    pub fn snapshot_unsorted(&self) -> Vec<FileRecord> {
         let mut output = Vec::with_capacity(self.records.len());
         let mut names = Vec::new();
         let mut visited = Vec::new();
@@ -90,17 +96,16 @@ impl Index {
             };
             output.push(FileRecord {
                 path,
-                volume_serial: Some(record.id.volume_serial),
-                file_reference: Some(record.id.file_reference),
-                parent_reference: Some(record.parent_reference),
+                volume_serial: Some(record.id.volume_serial).into(),
+                file_reference: Some(record.id.file_reference).into(),
+                parent_reference: Some(record.parent_reference).into(),
                 size: record.size,
                 date_modified: record.date_modified,
                 date_created: record.date_created,
-                attributes: Some(record.attributes),
+                attributes: Some(record.attributes).into(),
                 file_list_filename: None,
             });
         }
-        output.sort_unstable_by(|left, right| left.path.cmp(&right.path));
         output
     }
 
@@ -114,7 +119,6 @@ impl Index {
         if id.file_reference == volume.file_reference {
             return Some(format!("{}\\", volume.path.trim_end_matches(['\\', '/'])));
         }
-
         names.clear();
         visited.clear();
         let mut current = id;
@@ -145,6 +149,19 @@ impl Index {
         }
         Some(path)
     }
+
+    pub fn apply_changes(
+        &mut self,
+        removals: impl IntoIterator<Item = FileId>,
+        upserts: impl IntoIterator<Item = IndexRecord>,
+    ) {
+        for id in removals {
+            self.remove(id);
+        }
+        for record in upserts {
+            self.upsert(record);
+        }
+    }
 }
 
 impl SharedIndex {
@@ -159,9 +176,9 @@ impl SharedIndex {
         let mut restored = Vec::with_capacity(records.len());
         for record in records {
             let (Some(volume_serial), Some(file_reference), Some(parent_reference)) = (
-                record.volume_serial,
-                record.file_reference,
-                record.parent_reference,
+                record.volume_serial.get(),
+                record.file_reference.get(),
+                record.parent_reference.get(),
             ) else {
                 return Err("database record is missing NTFS identity metadata");
             };
@@ -201,8 +218,26 @@ impl SharedIndex {
         self.0.write().expect("index lock poisoned").remove(id)
     }
 
+    pub fn apply_changes(
+        &self,
+        removals: impl IntoIterator<Item = FileId>,
+        upserts: impl IntoIterator<Item = IndexRecord>,
+    ) {
+        self.0
+            .write()
+            .expect("index lock poisoned")
+            .apply_changes(removals, upserts);
+    }
+
     pub fn snapshot(&self) -> Vec<FileRecord> {
         self.0.read().expect("index lock poisoned").snapshot()
+    }
+
+    pub fn snapshot_unsorted(&self) -> Vec<FileRecord> {
+        self.0
+            .read()
+            .expect("index lock poisoned")
+            .snapshot_unsorted()
     }
 
     pub fn len(&self) -> usize {
@@ -227,9 +262,9 @@ mod tests {
             },
             parent_reference: parent,
             name: name.into(),
-            size: None,
-            date_modified: None,
-            date_created: None,
+            size: None.into(),
+            date_modified: None.into(),
+            date_created: None.into(),
             attributes,
         }
     }
@@ -298,12 +333,12 @@ mod tests {
     fn partial_updates_preserve_cached_metadata() {
         let mut index = Index::default();
         let mut original = record(20, 5, "file.txt", 0x20);
-        original.size = Some(123);
-        original.date_created = Some(456);
+        original.size = Some(123).into();
+        original.date_created = Some(456).into();
         index.upsert(original);
 
         let mut updated = record(20, 5, "renamed.txt", 0x20);
-        updated.date_modified = Some(789);
+        updated.date_modified = Some(789).into();
         index.upsert(updated);
 
         let record = index.records.values().next().unwrap();
@@ -311,5 +346,10 @@ mod tests {
         assert_eq!(record.size, Some(123));
         assert_eq!(record.date_created, Some(456));
         assert_eq!(record.date_modified, Some(789));
+    }
+
+    #[test]
+    fn index_records_stay_compact() {
+        assert_eq!(std::mem::size_of::<IndexRecord>(), 80);
     }
 }
