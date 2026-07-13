@@ -124,6 +124,17 @@ pub fn load_or_rebuild(
     refresh: impl FnOnce(DatabaseSnapshot) -> Result<DatabaseSnapshot, String>,
     build: impl FnOnce() -> Result<DatabaseSnapshot, String>,
 ) -> Result<Vec<FileRecord>, String> {
+    load_snapshot_or_rebuild(path, use_database, force_reindex, refresh, build)
+        .map(|snapshot| snapshot.records)
+}
+
+pub fn load_snapshot_or_rebuild(
+    path: &Path,
+    use_database: bool,
+    force_reindex: bool,
+    refresh: impl FnOnce(DatabaseSnapshot) -> Result<DatabaseSnapshot, String>,
+    build: impl FnOnce() -> Result<DatabaseSnapshot, String>,
+) -> Result<DatabaseSnapshot, String> {
     if use_database
         && !force_reindex
         && let Ok(snapshot) = read(path)
@@ -131,7 +142,7 @@ pub fn load_or_rebuild(
     {
         sort_records(&mut snapshot.records);
         write(path, &snapshot).map_err(|error| format!("save database failed: {error}"))?;
-        return Ok(snapshot.records);
+        return Ok(snapshot);
     }
 
     let mut snapshot = build()?;
@@ -139,7 +150,7 @@ pub fn load_or_rebuild(
     if use_database {
         write(path, &snapshot).map_err(|error| format!("save database failed: {error}"))?;
     }
-    Ok(snapshot.records)
+    Ok(snapshot)
 }
 
 #[cfg(windows)]
@@ -149,13 +160,26 @@ pub fn load_local(
     use_database: bool,
     force_reindex: bool,
 ) -> Result<Vec<FileRecord>, String> {
-    load_or_rebuild(
+    load_local_snapshot(path, pipe_name, use_database, force_reindex)
+        .map(|snapshot| snapshot.records)
+}
+
+#[cfg(windows)]
+pub fn load_local_snapshot(
+    path: &Path,
+    pipe_name: &str,
+    use_database: bool,
+    force_reindex: bool,
+) -> Result<DatabaseSnapshot, String> {
+    load_snapshot_or_rebuild(
         path,
         use_database,
         force_reindex,
         |snapshot| match refresh_direct(snapshot.clone()) {
             Ok(snapshot) => Ok(snapshot),
-            Err(error) if error.is_access_denied() => refresh_through_service(snapshot, pipe_name),
+            Err(error) if error.is_access_denied() => {
+                refresh_through_service(snapshot.clone(), pipe_name).or(Ok(snapshot))
+            }
             Err(error) => Err(error.to_string()),
         },
         || match build_direct() {

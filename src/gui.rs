@@ -45,7 +45,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::FileRecord;
-use crate::database;
+use crate::database::{self, VolumeCheckpoint};
+use crate::index::SharedIndex;
+use crate::monitor::{self, MonitorEvent};
 use crate::query::{Query, QueryOptions};
 
 mod options_dialog;
@@ -72,6 +74,7 @@ const CMD_HELP: usize = 1050;
 const CMD_ABOUT: usize = 1051;
 const WM_INDEX_LOADED: u32 = WM_APP + 1;
 const WM_OPTIONS_APPLIED: u32 = WM_APP + 2;
+const WM_INDEX_UPDATED: u32 = WM_APP + 3;
 const CF_UNICODETEXT: u32 = 13;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -160,6 +163,17 @@ fn parse_bool(value: &str) -> bool {
 }
 
 struct LoadResult {
+    loaded: Result<LoadedIndex, String>,
+}
+
+struct LoadedIndex {
+    records: Vec<FileRecord>,
+    index: SharedIndex,
+    checkpoints: Vec<VolumeCheckpoint>,
+}
+
+struct MonitorResult {
+    generation: u64,
     records: Result<Vec<FileRecord>, String>,
 }
 
@@ -181,6 +195,8 @@ struct AppState {
     settings_path: PathBuf,
     pipe_name: String,
     use_database: bool,
+    monitor: Option<monitor::Monitor>,
+    monitor_generation: u64,
 }
 
 pub fn run(
@@ -308,6 +324,8 @@ pub fn run(
         settings_path,
         pipe_name: pipe_name.to_owned(),
         use_database,
+        monitor: None,
+        monitor_generation: 0,
     });
     let state = Box::into_raw(state);
     unsafe {
@@ -382,8 +400,13 @@ unsafe extern "system" fn window_proc(
             let result = unsafe { Box::from_raw(lparam as *mut LoadResult) };
             let state = unsafe { &mut *state_ptr };
             state.loading = false;
-            match result.records {
-                Ok(records) => {
+            match result.loaded {
+                Ok(loaded) => {
+                    let LoadedIndex {
+                        records,
+                        index,
+                        checkpoints,
+                    } = loaded;
                     state.records = records;
                     if unsafe { window_text(state.search) }.is_empty()
                         && state.sort_column == 0
@@ -399,6 +422,15 @@ unsafe extern "system" fn window_proc(
                     } else {
                         unsafe { refresh_results(state) };
                     }
+                    state.monitor_generation = state.monitor_generation.wrapping_add(1);
+                    state.monitor = Some(start_monitor(
+                        window,
+                        index,
+                        checkpoints,
+                        state.pipe_name.clone(),
+                        state.use_database,
+                        state.monitor_generation,
+                    ));
                 }
                 Err(error) => {
                     state.records.clear();
@@ -408,6 +440,22 @@ unsafe extern "system" fn window_proc(
                         set_status(state, &error);
                     }
                 }
+            }
+            0
+        }
+        WM_INDEX_UPDATED if !state_ptr.is_null() => {
+            let result = unsafe { Box::from_raw(lparam as *mut MonitorResult) };
+            let state = unsafe { &mut *state_ptr };
+            if result.generation != state.monitor_generation {
+                return 0;
+            }
+            match result.records {
+                Ok(records) => {
+                    state.records = records;
+                    state.last_search = None;
+                    unsafe { refresh_results(state) };
+                }
+                Err(error) => unsafe { set_status(state, &error) },
             }
             0
         }
@@ -425,6 +473,8 @@ unsafe extern "system" fn window_proc(
                 save_settings(window, state);
             }
             if applied.force_rebuild {
+                state.monitor_generation = state.monitor_generation.wrapping_add(1);
+                state.monitor = None;
                 state.loading = true;
                 state.records.clear();
                 state.visible.clear();
@@ -974,8 +1024,8 @@ fn format_file_time(value: u64) -> String {
 fn start_index_load(window: HWND, pipe_name: String, use_database: bool, force_reindex: bool) {
     let window_value = window as isize;
     thread::spawn(move || {
-        let records = load_local_records(&pipe_name, use_database, force_reindex);
-        let result = Box::into_raw(Box::new(LoadResult { records }));
+        let loaded = load_local_index(&pipe_name, use_database, force_reindex);
+        let result = Box::into_raw(Box::new(LoadResult { loaded }));
         let posted =
             unsafe { PostMessageW(window_value as HWND, WM_INDEX_LOADED, 0, result as isize) };
         if posted == 0 {
@@ -984,13 +1034,63 @@ fn start_index_load(window: HWND, pipe_name: String, use_database: bool, force_r
     });
 }
 
-fn load_local_records(
+fn load_local_index(
     pipe_name: &str,
     use_database: bool,
     force_reindex: bool,
-) -> Result<Vec<FileRecord>, String> {
+) -> Result<LoadedIndex, String> {
     let database_path = database::default_path();
-    database::load_local(&database_path, pipe_name, use_database, force_reindex)
+    let snapshot =
+        database::load_local_snapshot(&database_path, pipe_name, use_database, force_reindex)?;
+    let index = SharedIndex::restore(
+        &snapshot.records,
+        snapshot.volumes.iter().map(|volume| {
+            (
+                volume.volume_serial,
+                volume.root.clone(),
+                volume.root_file_reference,
+            )
+        }),
+    )
+    .map_err(str::to_owned)?;
+    Ok(LoadedIndex {
+        records: snapshot.records,
+        index,
+        checkpoints: snapshot.volumes,
+    })
+}
+
+fn start_monitor(
+    window: HWND,
+    index: SharedIndex,
+    checkpoints: Vec<VolumeCheckpoint>,
+    pipe_name: String,
+    use_database: bool,
+    generation: u64,
+) -> monitor::Monitor {
+    let window_value = window as isize;
+    monitor::start(
+        index,
+        checkpoints,
+        pipe_name,
+        database::default_path(),
+        use_database,
+        move |event| {
+            let records = match event {
+                MonitorEvent::Updated(records) => Ok(records),
+                MonitorEvent::Error(error) => Err(error),
+            };
+            let result = Box::into_raw(Box::new(MonitorResult {
+                generation,
+                records,
+            }));
+            let posted =
+                unsafe { PostMessageW(window_value as HWND, WM_INDEX_UPDATED, 0, result as isize) };
+            if posted == 0 {
+                unsafe { drop(Box::from_raw(result)) };
+            }
+        },
+    )
 }
 
 unsafe fn insert_columns(list: HWND) {

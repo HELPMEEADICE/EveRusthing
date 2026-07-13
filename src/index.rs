@@ -52,7 +52,15 @@ impl Index {
     }
 
     pub fn upsert(&mut self, record: IndexRecord) {
-        self.records.insert(record.id, record);
+        if let Some(previous) = self.records.get(&record.id) {
+            let mut record = record;
+            record.size = record.size.or(previous.size);
+            record.date_modified = record.date_modified.or(previous.date_modified);
+            record.date_created = record.date_created.or(previous.date_created);
+            self.records.insert(record.id, record);
+        } else {
+            self.records.insert(record.id, record);
+        }
     }
 
     pub fn extend(&mut self, records: impl IntoIterator<Item = IndexRecord>) {
@@ -284,5 +292,24 @@ mod tests {
             .map(|record| record.path)
             .collect();
         assert_eq!(paths, ["C:\\", "C:\\folder", "C:\\folder\\file.txt"]);
+    }
+
+    #[test]
+    fn partial_updates_preserve_cached_metadata() {
+        let mut index = Index::default();
+        let mut original = record(20, 5, "file.txt", 0x20);
+        original.size = Some(123);
+        original.date_created = Some(456);
+        index.upsert(original);
+
+        let mut updated = record(20, 5, "renamed.txt", 0x20);
+        updated.date_modified = Some(789);
+        index.upsert(updated);
+
+        let record = index.records.values().next().unwrap();
+        assert_eq!(record.name, "renamed.txt");
+        assert_eq!(record.size, Some(123));
+        assert_eq!(record.date_created, Some(456));
+        assert_eq!(record.date_modified, Some(789));
     }
 }

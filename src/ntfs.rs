@@ -476,7 +476,9 @@ fn to_index_record(volume_serial: u64, record: UsnRecord) -> IndexRecord {
         parent_reference: record.parent_reference,
         name: record.name,
         size: None,
-        date_modified: None,
+        date_modified: u64::try_from(record.timestamp)
+            .ok()
+            .filter(|value| *value != 0),
         date_created: None,
         attributes: record.attributes,
     }
@@ -740,5 +742,40 @@ mod tests {
                 .iter()
                 .any(|record| record.path == "C:\\new\\child.txt")
         );
+    }
+
+    #[test]
+    fn metadata_change_updates_timestamp_without_losing_cached_size() {
+        let source = SharedIndex::default();
+        source.register_volume(42, "C:\\".into(), 5);
+        let mut original = to_index_record(
+            42,
+            UsnRecord {
+                name: "file.txt".into(),
+                attributes: 0x20,
+                ..parsed_record(20, 5)
+            },
+        );
+        original.size = Some(4096);
+        source.upsert(original);
+
+        apply_usn_batch(
+            &source,
+            42,
+            &UsnBatch {
+                next_usn: 3,
+                records: vec![UsnRecord {
+                    name: "file.txt".into(),
+                    timestamp: 123_456,
+                    reason: 0x8000,
+                    attributes: 0x20,
+                    ..parsed_record(20, 5)
+                }],
+            },
+        );
+
+        let record = source.snapshot().pop().unwrap();
+        assert_eq!(record.size, Some(4096));
+        assert_eq!(record.date_modified, Some(123_456));
     }
 }
