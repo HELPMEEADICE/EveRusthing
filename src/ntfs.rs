@@ -228,17 +228,15 @@ impl NtfsVolume {
 
             input.StartFileReferenceNumber = read_u64(&buffer, 0)?;
             let records = parse_usn_records(&buffer[8..returned as usize])?;
-            let mut batch = Vec::with_capacity(records.len());
-            for record in records {
+            record_count += records.len();
+            index.extend(records.into_iter().map(|record| {
                 observe_root_reference(
                     &record,
                     &mut root_record_reference,
                     &mut root_parent_reference,
                 );
-                batch.push(to_index_record(self.info.volume_serial, record));
-                record_count += 1;
-            }
-            index.extend(batch);
+                to_index_record(self.info.volume_serial, record)
+            }));
         }
 
         let root_file_reference = root_record_reference
@@ -420,10 +418,6 @@ fn parse_usn_records(bytes: &[u8]) -> Result<Vec<UsnRecord>, NtfsError> {
             return Err(NtfsError::malformed("invalid USN filename range"));
         }
         let name_bytes = &bytes[offset + name_offset..offset + name_offset + name_length];
-        let name_wide: Vec<u16> = name_bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect();
         records.push(UsnRecord {
             file_reference: read_u64(bytes, offset + 8)?,
             parent_reference: read_u64(bytes, offset + 16)?,
@@ -431,11 +425,22 @@ fn parse_usn_records(bytes: &[u8]) -> Result<Vec<UsnRecord>, NtfsError> {
             timestamp: read_i64(bytes, offset + 32)?,
             reason: read_u32(bytes, offset + 40)?,
             attributes: read_u32(bytes, offset + 52)?,
-            name: String::from_utf16_lossy(&name_wide),
+            name: decode_utf16_lossy(name_bytes),
         });
         offset += length;
     }
     Ok(records)
+}
+
+fn decode_utf16_lossy(bytes: &[u8]) -> String {
+    let code_units = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+    let mut output = String::with_capacity(bytes.len() / 2);
+    for character in char::decode_utf16(code_units) {
+        output.push(character.unwrap_or(char::REPLACEMENT_CHARACTER));
+    }
+    output
 }
 
 fn observe_root_reference(

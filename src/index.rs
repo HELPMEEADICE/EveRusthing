@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::model::FileRecord;
@@ -74,8 +74,10 @@ impl Index {
 
     pub fn snapshot(&self) -> Vec<FileRecord> {
         let mut output = Vec::with_capacity(self.records.len());
+        let mut names = Vec::new();
+        let mut visited = Vec::new();
         for record in self.records.values() {
-            let Some(path) = self.resolve_path(record.id) else {
+            let Some(path) = self.resolve_path(record.id, &mut names, &mut visited) else {
                 continue;
             };
             output.push(FileRecord {
@@ -93,19 +95,25 @@ impl Index {
         output
     }
 
-    fn resolve_path(&self, id: FileId) -> Option<String> {
+    fn resolve_path<'a>(
+        &'a self,
+        id: FileId,
+        names: &mut Vec<&'a str>,
+        visited: &mut Vec<u64>,
+    ) -> Option<String> {
         let volume = self.volumes.get(&id.volume_serial)?;
         if id.file_reference == volume.file_reference {
             return Some(format!("{}\\", volume.path.trim_end_matches(['\\', '/'])));
         }
 
-        let mut names = Vec::new();
+        names.clear();
+        visited.clear();
         let mut current = id;
-        let mut visited = HashSet::new();
         loop {
-            if !visited.insert(current.file_reference) {
+            if visited.contains(&current.file_reference) {
                 return None;
             }
+            visited.push(current.file_reference);
             if current.file_reference == volume.file_reference {
                 break;
             }
@@ -118,7 +126,10 @@ impl Index {
         }
 
         names.reverse();
-        let mut path = volume.path.trim_end_matches(['\\', '/']).to_owned();
+        let root = volume.path.trim_end_matches(['\\', '/']);
+        let path_len = root.len() + names.iter().map(|name| name.len() + 1).sum::<usize>();
+        let mut path = String::with_capacity(path_len);
+        path.push_str(root);
         for name in names {
             path.push('\\');
             path.push_str(name);
