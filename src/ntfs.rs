@@ -183,6 +183,11 @@ impl NtfsVolume {
         &self.info
     }
 
+    pub fn journal_state(&self) -> Result<(u64, i64), NtfsError> {
+        let journal = self.query_journal()?;
+        Ok((journal.UsnJournalID, journal.NextUsn))
+    }
+
     pub fn scan_into(&self, index: &SharedIndex) -> Result<ScanResult, NtfsError> {
         let journal = self.query_journal()?;
         let mut input = MFT_ENUM_DATA_V0 {
@@ -349,6 +354,10 @@ fn apply_usn_batch(index: &SharedIndex, volume_serial: u64, batch: &UsnBatch) {
             index.upsert(to_index_record(volume_serial, record.clone()));
         }
     }
+}
+
+pub fn apply_usn_changes(index: &SharedIndex, volume_serial: u64, batch: &UsnBatch) {
+    apply_usn_batch(index, volume_serial, batch);
 }
 
 pub fn discover_ntfs_volumes() -> Result<Vec<String>, NtfsError> {
@@ -685,5 +694,51 @@ mod tests {
             },
         );
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn cached_parent_links_keep_descendants_valid_after_directory_rename() {
+        let source = SharedIndex::default();
+        source.register_volume(42, "C:\\".into(), 5);
+        source.extend([
+            to_index_record(42, parsed_record(5, 5)),
+            to_index_record(
+                42,
+                UsnRecord {
+                    name: "old".into(),
+                    ..parsed_record(10, 5)
+                },
+            ),
+            to_index_record(
+                42,
+                UsnRecord {
+                    name: "child.txt".into(),
+                    attributes: 0x20,
+                    ..parsed_record(20, 10)
+                },
+            ),
+        ]);
+        let cached = source.snapshot();
+        let restored = SharedIndex::restore(&cached, [(42, "C:\\".into(), 5)]).unwrap();
+
+        apply_usn_batch(
+            &restored,
+            42,
+            &UsnBatch {
+                next_usn: 2,
+                records: vec![UsnRecord {
+                    name: "new".into(),
+                    reason: 0x2000,
+                    ..parsed_record(10, 5)
+                }],
+            },
+        );
+
+        assert!(
+            restored
+                .snapshot()
+                .iter()
+                .any(|record| record.path == "C:\\new\\child.txt")
+        );
     }
 }

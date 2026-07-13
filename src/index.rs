@@ -84,6 +84,7 @@ impl Index {
                 path,
                 volume_serial: Some(record.id.volume_serial),
                 file_reference: Some(record.id.file_reference),
+                parent_reference: Some(record.parent_reference),
                 size: record.size,
                 date_modified: record.date_modified,
                 date_created: record.date_created,
@@ -139,6 +140,40 @@ impl Index {
 }
 
 impl SharedIndex {
+    pub fn restore(
+        records: &[FileRecord],
+        volumes: impl IntoIterator<Item = (u64, String, u64)>,
+    ) -> Result<Self, &'static str> {
+        let index = Self::default();
+        for (volume_serial, root, root_file_reference) in volumes {
+            index.register_volume(volume_serial, root, root_file_reference);
+        }
+        let mut restored = Vec::with_capacity(records.len());
+        for record in records {
+            let (Some(volume_serial), Some(file_reference), Some(parent_reference)) = (
+                record.volume_serial,
+                record.file_reference,
+                record.parent_reference,
+            ) else {
+                return Err("database record is missing NTFS identity metadata");
+            };
+            restored.push(IndexRecord {
+                id: FileId {
+                    volume_serial,
+                    file_reference,
+                },
+                parent_reference,
+                name: record.file_name().to_owned(),
+                size: record.size,
+                date_modified: record.date_modified,
+                date_created: record.date_created,
+                attributes: record.attributes.unwrap_or_default(),
+            });
+        }
+        index.extend(restored);
+        Ok(index)
+    }
+
     pub fn register_volume(&self, volume_serial: u64, path: String, root_file_reference: u64) {
         self.0
             .write()
@@ -232,5 +267,22 @@ mod tests {
         index.upsert(record(21, 20, "b", FILE_ATTRIBUTE_DIRECTORY));
 
         assert!(index.snapshot().is_empty());
+    }
+
+    #[test]
+    fn restores_parent_links_from_a_database_snapshot() {
+        let mut source = Index::default();
+        source.register_volume(42, "C:", 5);
+        source.upsert(record(5, 5, ".", FILE_ATTRIBUTE_DIRECTORY));
+        source.upsert(record(10, 5, "folder", FILE_ATTRIBUTE_DIRECTORY));
+        source.upsert(record(20, 10, "file.txt", 0x20));
+
+        let restored = SharedIndex::restore(&source.snapshot(), [(42, "C:\\".into(), 5)]).unwrap();
+        let paths: Vec<_> = restored
+            .snapshot()
+            .into_iter()
+            .map(|record| record.path)
+            .collect();
+        assert_eq!(paths, ["C:\\", "C:\\folder", "C:\\folder\\file.txt"]);
     }
 }

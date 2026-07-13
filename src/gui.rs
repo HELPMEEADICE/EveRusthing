@@ -46,10 +46,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::FileRecord;
 use crate::database;
-use crate::index::SharedIndex;
-use crate::ntfs::{NtfsVolume, discover_ntfs_volumes};
 use crate::query::{Query, QueryOptions};
-use crate::service;
 
 mod options_dialog;
 
@@ -993,27 +990,7 @@ fn load_local_records(
     force_reindex: bool,
 ) -> Result<Vec<FileRecord>, String> {
     let database_path = database::default_path();
-    database::load_or_rebuild(&database_path, use_database, force_reindex, || {
-        match load_local_records_direct() {
-            Ok(records) => Ok(records),
-            Err(error) if error.is_access_denied() => service::scan_local(pipe_name)
-                .map(|scan| scan.records)
-                .map_err(|service_error| {
-                    format!("{error}; service fallback also failed: {service_error}")
-                }),
-            Err(error) => Err(error.to_string()),
-        }
-    })
-}
-
-fn load_local_records_direct() -> Result<Vec<FileRecord>, crate::ntfs::NtfsError> {
-    let index = SharedIndex::default();
-    for root in discover_ntfs_volumes()? {
-        let volume = NtfsVolume::open(&root)?;
-        let scan = volume.scan_into(&index)?;
-        volume.catch_up(&index, scan.next_usn, scan.journal_id)?;
-    }
-    Ok(index.snapshot())
+    database::load_local(&database_path, pipe_name, use_database, force_reindex)
 }
 
 unsafe fn insert_columns(list: HWND) {

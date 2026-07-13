@@ -2,15 +2,18 @@ use std::fmt::{self, Display, Formatter};
 use std::io::{self, Read, Write};
 
 use crate::model::FileRecord;
+use crate::ntfs::{UsnBatch, UsnRecord};
 
 pub const MAX_FRAME_SIZE: usize = 8 * 1024 * 1024;
 pub const COMMAND_PING: u32 = 0x4556_0000;
 pub const COMMAND_SCAN_ALL: u32 = 0x4556_0001;
+pub const COMMAND_READ_USN: u32 = 0x4556_0002;
 pub const REPLY_PONG: u32 = 0x4556_8000;
 pub const REPLY_VOLUME: u32 = 0x4556_8001;
 pub const REPLY_RECORDS: u32 = 0x4556_8002;
 pub const REPLY_DONE: u32 = 0x4556_8003;
 pub const REPLY_ERROR: u32 = 5;
+pub const REPLY_USN_BATCH: u32 = 0x4556_8004;
 
 const NONE_U64: u64 = u64::MAX;
 const NONE_U32: u32 = u32::MAX;
@@ -119,6 +122,7 @@ pub fn encode_records(records: &[FileRecord]) -> Vec<u8> {
     for record in records {
         push_u64(&mut output, record.volume_serial.unwrap_or(NONE_U64));
         push_u64(&mut output, record.file_reference.unwrap_or(NONE_U64));
+        push_u64(&mut output, record.parent_reference.unwrap_or(NONE_U64));
         push_u64(&mut output, record.size.unwrap_or(NONE_U64));
         push_u64(&mut output, record.date_modified.unwrap_or(NONE_U64));
         push_u64(&mut output, record.date_created.unwrap_or(NONE_U64));
@@ -138,6 +142,7 @@ pub fn decode_records(bytes: &[u8]) -> Result<Vec<FileRecord>, ProtocolError> {
     for _ in 0..count {
         let volume_serial = optional_u64(decoder.u64()?);
         let file_reference = optional_u64(decoder.u64()?);
+        let parent_reference = optional_u64(decoder.u64()?);
         let size = optional_u64(decoder.u64()?);
         let date_modified = optional_u64(decoder.u64()?);
         let date_created = optional_u64(decoder.u64()?);
@@ -147,6 +152,7 @@ pub fn decode_records(bytes: &[u8]) -> Result<Vec<FileRecord>, ProtocolError> {
             path,
             volume_serial,
             file_reference,
+            parent_reference,
             size,
             date_modified,
             date_created,
@@ -163,7 +169,7 @@ pub fn records_in_pages(records: &[FileRecord], target_size: usize) -> Vec<&[Fil
     let mut start = 0;
     let mut size = 4;
     for (index, record) in records.iter().enumerate() {
-        let record_size = 48 + 4 + record.path.len();
+        let record_size = 56 + 4 + record.path.len();
         if index > start && size + record_size > target_size {
             pages.push(&records[start..index]);
             start = index;
@@ -175,6 +181,45 @@ pub fn records_in_pages(records: &[FileRecord], target_size: usize) -> Vec<&[Fil
         pages.push(&records[start..]);
     }
     pages
+}
+
+pub fn encode_usn_batch(batch: &UsnBatch) -> Vec<u8> {
+    let mut output = Vec::new();
+    push_i64(&mut output, batch.next_usn);
+    push_u32(&mut output, batch.records.len() as u32);
+    for record in &batch.records {
+        push_u64(&mut output, record.file_reference);
+        push_u64(&mut output, record.parent_reference);
+        push_i64(&mut output, record.usn);
+        push_i64(&mut output, record.timestamp);
+        push_u32(&mut output, record.reason);
+        push_u32(&mut output, record.attributes);
+        push_string(&mut output, &record.name);
+    }
+    output
+}
+
+pub fn decode_usn_batch(bytes: &[u8]) -> Result<UsnBatch, ProtocolError> {
+    let mut decoder = Decoder::new(bytes);
+    let next_usn = decoder.i64()?;
+    let count = decoder.u32()? as usize;
+    if count > bytes.len() / 4 {
+        return Err(ProtocolError::InvalidFrame("impossible USN record count"));
+    }
+    let mut records = Vec::with_capacity(count);
+    for _ in 0..count {
+        records.push(UsnRecord {
+            file_reference: decoder.u64()?,
+            parent_reference: decoder.u64()?,
+            usn: decoder.i64()?,
+            timestamp: decoder.i64()?,
+            reason: decoder.u32()?,
+            attributes: decoder.u32()?,
+            name: decoder.string()?,
+        });
+    }
+    decoder.finish()?;
+    Ok(UsnBatch { next_usn, records })
 }
 
 fn optional_u64(value: u64) -> Option<u64> {
@@ -298,6 +343,7 @@ mod tests {
             path: "C:\\src\\main.rs".into(),
             volume_serial: Some(42),
             file_reference: Some(10),
+            parent_reference: Some(5),
             size: None,
             date_modified: Some(20),
             date_created: None,
@@ -305,6 +351,20 @@ mod tests {
             file_list_filename: None,
         }];
         assert_eq!(decode_records(&encode_records(&records)).unwrap(), records);
+
+        let batch = UsnBatch {
+            next_usn: 101,
+            records: vec![UsnRecord {
+                file_reference: 10,
+                parent_reference: 5,
+                usn: 100,
+                timestamp: 20,
+                reason: 0x100,
+                attributes: 0x20,
+                name: "new.txt".into(),
+            }],
+        };
+        assert_eq!(decode_usn_batch(&encode_usn_batch(&batch)).unwrap(), batch);
     }
 
     #[test]

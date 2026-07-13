@@ -39,10 +39,11 @@ use windows_sys::Win32::System::Services::{
 
 use crate::index::SharedIndex;
 use crate::model::FileRecord;
-use crate::ntfs::{NtfsVolume, discover_ntfs_volumes};
+use crate::ntfs::{NtfsVolume, apply_usn_changes, discover_ntfs_volumes};
 use crate::service_protocol::{
-    COMMAND_PING, COMMAND_SCAN_ALL, Frame, ProtocolError, REPLY_DONE, REPLY_ERROR, REPLY_PONG,
-    REPLY_RECORDS, REPLY_VOLUME, VolumeReply, decode_records, decode_volume, encode_records,
+    COMMAND_PING, COMMAND_READ_USN, COMMAND_SCAN_ALL, Frame, ProtocolError, REPLY_DONE,
+    REPLY_ERROR, REPLY_PONG, REPLY_RECORDS, REPLY_USN_BATCH, REPLY_VOLUME, VolumeReply,
+    decode_records, decode_usn_batch, decode_volume, encode_records, encode_usn_batch,
     encode_volume, read_frame, records_in_pages, write_frame,
 };
 
@@ -265,6 +266,52 @@ pub fn scan_local(pipe_name: &str) -> Result<ServiceScan, ServiceError> {
     }
 }
 
+pub fn catch_up_volume(
+    pipe_name: &str,
+    index: &SharedIndex,
+    checkpoint: &VolumeReply,
+) -> Result<VolumeReply, ServiceError> {
+    let mut pipe = connect_pipe(pipe_name)?;
+    write_frame(
+        &mut pipe,
+        &Frame {
+            code: COMMAND_READ_USN,
+            payload: encode_volume(checkpoint),
+        },
+    )
+    .map_err(protocol_error("send service USN request"))?;
+
+    let mut updated = None;
+    loop {
+        let frame = read_frame(&mut pipe).map_err(protocol_error("read service USN reply"))?;
+        match frame.code {
+            REPLY_USN_BATCH => {
+                let batch = decode_usn_batch(&frame.payload)
+                    .map_err(protocol_error("decode service USN batch"))?;
+                apply_usn_changes(index, checkpoint.volume_serial, &batch);
+            }
+            REPLY_VOLUME => {
+                updated = Some(
+                    decode_volume(&frame.payload)
+                        .map_err(protocol_error("decode service USN checkpoint"))?,
+                );
+            }
+            REPLY_DONE => {
+                return updated.ok_or_else(|| {
+                    ServiceError::detail("read service USN reply", "missing updated checkpoint")
+                });
+            }
+            REPLY_ERROR => return Err(decode_service_error(&frame.payload)),
+            _ => {
+                return Err(ServiceError::detail(
+                    "read service USN reply",
+                    "unexpected reply code",
+                ));
+            }
+        }
+    }
+}
+
 pub fn ping(pipe_name: &str) -> Result<(), ServiceError> {
     let mut pipe = connect_pipe(pipe_name)?;
     write_frame(
@@ -463,8 +510,62 @@ fn handle_client(pipe: &mut Handle) -> Result<(), ServiceError> {
         )
         .map_err(protocol_error("write service ping")),
         COMMAND_SCAN_ALL => stream_local_index(pipe),
+        COMMAND_READ_USN => {
+            let checkpoint = decode_volume(&request.payload)
+                .map_err(protocol_error("decode service USN request"))?;
+            stream_usn_changes(pipe, checkpoint)
+        }
         _ => send_error(pipe, 87, "unknown service command"),
     }
+}
+
+fn stream_usn_changes(pipe: &mut Handle, mut checkpoint: VolumeReply) -> Result<(), ServiceError> {
+    let volume = NtfsVolume::open(&checkpoint.root)
+        .map_err(|error| ServiceError::detail("open NTFS volume", error.to_string()))?;
+    if volume.info().volume_serial != checkpoint.volume_serial {
+        return send_error(pipe, 1170, "NTFS volume serial changed");
+    }
+    let (journal_id, journal_next_usn) = volume
+        .journal_state()
+        .map_err(|error| ServiceError::detail("query USN journal", error.to_string()))?;
+    if journal_id != checkpoint.journal_id || checkpoint.next_usn > journal_next_usn {
+        return send_error(pipe, 1170, "USN journal checkpoint is no longer valid");
+    }
+
+    loop {
+        let batch = volume
+            .read_changes(checkpoint.next_usn, checkpoint.journal_id)
+            .map_err(|error| ServiceError::detail("read USN journal", error.to_string()))?;
+        let done = batch.records.is_empty() || batch.next_usn == checkpoint.next_usn;
+        checkpoint.next_usn = batch.next_usn;
+        write_frame(
+            pipe,
+            &Frame {
+                code: REPLY_USN_BATCH,
+                payload: encode_usn_batch(&batch),
+            },
+        )
+        .map_err(protocol_error("write service USN batch"))?;
+        if done {
+            break;
+        }
+    }
+    write_frame(
+        pipe,
+        &Frame {
+            code: REPLY_VOLUME,
+            payload: encode_volume(&checkpoint),
+        },
+    )
+    .map_err(protocol_error("write service USN checkpoint"))?;
+    write_frame(
+        pipe,
+        &Frame {
+            code: REPLY_DONE,
+            payload: Vec::new(),
+        },
+    )
+    .map_err(protocol_error("write service USN completion"))
 }
 
 fn stream_local_index(pipe: &mut Handle) -> Result<(), ServiceError> {

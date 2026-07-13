@@ -5,10 +5,6 @@ use std::process::ExitCode;
 use everusthing::efu;
 #[cfg(windows)]
 use everusthing::gui;
-#[cfg(windows)]
-use everusthing::index::SharedIndex;
-#[cfg(windows)]
-use everusthing::ntfs::{NtfsVolume, discover_ntfs_volumes};
 use everusthing::query::{Query, QueryOptions};
 #[cfg(windows)]
 use everusthing::service::{self, DEFAULT_PIPE_NAME};
@@ -138,45 +134,7 @@ fn load_local_index(
     force_reindex: bool,
 ) -> Result<Vec<everusthing::FileRecord>, String> {
     let database_path = everusthing::database::default_path();
-    everusthing::database::load_or_rebuild(&database_path, use_database, force_reindex, || {
-        match load_local_index_direct() {
-            Ok(records) => Ok(records),
-            Err(error) if error.is_access_denied() => {
-                eprintln!("Direct volume access denied; connecting to the EveRusthing service...");
-                let scan = service::scan_local(pipe_name).map_err(|service_error| {
-                    format!("{error}; service fallback also failed: {service_error}")
-                })?;
-                for volume in scan.volumes {
-                    eprintln!(
-                        "Indexed {} records from {} through the service (serial {:016x})",
-                        volume.record_count, volume.root, volume.volume_serial
-                    );
-                }
-                Ok(scan.records)
-            }
-            Err(error) => Err(error.to_string()),
-        }
-    })
-}
-
-#[cfg(windows)]
-fn load_local_index_direct() -> Result<Vec<everusthing::FileRecord>, everusthing::ntfs::NtfsError> {
-    let roots = discover_ntfs_volumes()?;
-    if roots.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let index = SharedIndex::default();
-    for root in roots {
-        let volume = NtfsVolume::open(&root)?;
-        let scan = volume.scan_into(&index)?;
-        volume.catch_up(&index, scan.next_usn, scan.journal_id)?;
-        eprintln!(
-            "Indexed {} records from {} (serial {:016x})",
-            scan.record_count, scan.volume.root, scan.volume.volume_serial
-        );
-    }
-    Ok(index.snapshot())
+    everusthing::database::load_local(&database_path, pipe_name, use_database, force_reindex)
 }
 
 #[cfg(not(windows))]

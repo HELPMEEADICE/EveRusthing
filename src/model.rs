@@ -8,6 +8,7 @@ pub struct FileRecord {
     pub path: String,
     pub volume_serial: Option<u64>,
     pub file_reference: Option<u64>,
+    pub parent_reference: Option<u64>,
     pub size: Option<u64>,
     pub date_modified: Option<u64>,
     pub date_created: Option<u64>,
